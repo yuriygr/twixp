@@ -1,0 +1,10 @@
+/bin/
+/.gopath-xp/
+/data/
+.assets/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+/config.go
+Prompt.md

@@ -1,0 +1,16 @@
+//go:build windows
+// +build windows
+
+package main
+
+// clientID — Client ID Twitch-приложения для Device Code Flow. Client
+// ID (в отличие от client secret, которого у Device Code Flow и вовсе
+// нет) не секрет — Twitch сам подтверждает это в документации флоу.
+// Тем не менее сам файл не хранится в репозитории (см. .gitignore):
+// это Client ID конкретного зарегистрированного Twitch-приложения, и
+// у каждого, кто собирает TwiXP из исходников, должен быть свой —
+// иначе все сборки светятся перед Twitch под одним и тем же
+// приложением. Шаблон для нового Client ID — config.go.example рядом.
+const clientID = "i7j94u6mk0D9cwa5hbltgmxucfk5rc"
+
+var scopes = []string{"user:read:chat", "user:write:chat"}
