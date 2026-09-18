@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"twitchclient/internal/app"
-	"twitchclient/internal/domain"
-	"twitchclient/internal/infra/nettls"
+	"twixp/internal/app"
+	"twixp/internal/domain"
+	"twixp/internal/infra/nettls"
 )
 
 const (

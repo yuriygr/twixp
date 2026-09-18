@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 
-	"twitchclient/internal/app"
-	"twitchclient/internal/domain"
+	"twixp/internal/app"
+	"twixp/internal/domain"
 )
 
 // Store — единственное окно для всего, что приложение сохраняет между

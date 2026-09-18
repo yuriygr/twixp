@@ -9,7 +9,7 @@ import (
 
 	"github.com/lxn/win"
 
-	"twitchclient/internal/domain"
+	"twixp/internal/domain"
 )
 
 // mentionPopup — всплывающий список подсказок для "@упоминания" в поле

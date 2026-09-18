@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"net/url"
 
-	"twitchclient/internal/app"
-	"twitchclient/internal/domain"
-	"twitchclient/internal/infra/nettls"
+	"twixp/internal/app"
+	"twixp/internal/domain"
+	"twixp/internal/infra/nettls"
 )
 
 const defaultBaseURL = "https://api.twitch.tv/helix"

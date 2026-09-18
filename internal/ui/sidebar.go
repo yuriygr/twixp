@@ -12,8 +12,8 @@ import (
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
 
-	"twitchclient/internal/app"
-	"twitchclient/internal/domain"
+	"twixp/internal/app"
+	"twixp/internal/domain"
 )
 
 // avatarSize — сторона иконки в сайдбаре, в пикселях. 16×16 — это то,

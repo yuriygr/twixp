@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"twitchclient/internal/domain"
+	"twixp/internal/domain"
 )
 
 // ErrNoReusableToken — TryReuse не смог воспользоваться сохранённым

@@ -9,7 +9,7 @@ import (
 	"github.com/lxn/walk"
 	"github.com/lxn/walk/declarative"
 
-	"twitchclient/internal/domain"
+	"twixp/internal/domain"
 )
 
 // showSettingsDialog показывает модальный диалог настроек — отдельное

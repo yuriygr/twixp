@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"twitchclient/internal/domain"
+	"twixp/internal/domain"
 )
 
 // eventSubEnvelope — общая форма всех сообщений EventSub WebSocket.

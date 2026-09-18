@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"twitchclient/internal/domain"
+	"twixp/internal/domain"
 )
 
 // ChatWorkspace держит коллекцию одновременно открытых чатов — по

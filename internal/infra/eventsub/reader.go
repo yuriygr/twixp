@@ -3,8 +3,8 @@ package eventsub
 import (
 	"fmt"
 
-	"twitchclient/internal/app"
-	"twitchclient/internal/domain"
+	"twixp/internal/app"
+	"twixp/internal/domain"
 )
 
 // hubReader реализует app.ChatReader для одного конкретного канала.

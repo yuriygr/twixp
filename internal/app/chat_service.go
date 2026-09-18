@@ -3,7 +3,7 @@ package app
 import (
 	"fmt"
 
-	"twitchclient/internal/domain"
+	"twixp/internal/domain"
 )
 
 // ChatService оркестрирует чтение и отправку сообщений для одного

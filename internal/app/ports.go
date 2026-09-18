@@ -3,7 +3,7 @@ package app
 import (
 	"errors"
 
-	"twitchclient/internal/domain"
+	"twixp/internal/domain"
 )
 
 // ErrNoToken возвращается TokenStore.Load, если токен ещё не был

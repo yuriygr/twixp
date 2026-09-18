@@ -11,15 +11,15 @@ import (
 	"log"
 	"net/http"
 
-	"twitchclient/internal/app"
-	"twitchclient/internal/domain"
-	"twitchclient/internal/infra/applog"
-	"twitchclient/internal/infra/auth"
-	"twitchclient/internal/infra/eventsub"
-	"twitchclient/internal/infra/helix"
-	"twitchclient/internal/infra/nettls"
-	"twitchclient/internal/infra/store"
-	"twitchclient/internal/ui"
+	"twixp/internal/app"
+	"twixp/internal/domain"
+	"twixp/internal/infra/applog"
+	"twixp/internal/infra/auth"
+	"twixp/internal/infra/eventsub"
+	"twixp/internal/infra/helix"
+	"twixp/internal/infra/nettls"
+	"twixp/internal/infra/store"
+	"twixp/internal/ui"
 )
 
 // Компиляционная проверка: helix.Client реализует то, что ожидает

@@ -14,7 +14,7 @@ import (
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
 
-	"twitchclient/internal/domain"
+	"twixp/internal/domain"
 )
 
 // chatLine — одна строка истории в чистом, не привязанном к domain

@@ -35,8 +35,8 @@ import (
 	"github.com/lxn/walk/declarative"
 	"github.com/lxn/win"
 
-	"twitchclient/internal/app"
-	"twitchclient/internal/domain"
+	"twixp/internal/app"
+	"twixp/internal/domain"
 )
 
 // ChannelResolver находит канал по логину (то же самое, что делает

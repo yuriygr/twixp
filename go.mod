@@ -1,4 +1,4 @@
-module twitchclient
+module twixp
 
 go 1.11
 

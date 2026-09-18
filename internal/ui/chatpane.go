@@ -14,8 +14,8 @@ import (
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
 
-	"twitchclient/internal/app"
-	"twitchclient/internal/domain"
+	"twixp/internal/app"
+	"twixp/internal/domain"
 )
 
 // maxHistoryLines — сколько сообщений истории держим на канал.
