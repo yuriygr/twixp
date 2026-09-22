@@ -658,17 +658,22 @@ func (h *Hub) unsubscribe(channelID string) error {
 
 	err := h.subs.DeleteSubscription(state.subscriptionID)
 
-	if state.notificationSubscriptionID != "" {
-		if notifyErr := h.subs.DeleteSubscription(state.notificationSubscriptionID); notifyErr != nil && err == nil {
-			err = notifyErr
-		}
-	}
-
-	if state.deleteSubscriptionID != "" {
-		if delErr := h.subs.DeleteSubscription(state.deleteSubscriptionID); delErr != nil && err == nil {
-			err = delErr
-		}
-	}
+	h.deleteIfSet(state.notificationSubscriptionID, &err)
+	h.deleteIfSet(state.deleteSubscriptionID, &err)
 
 	return err
+}
+
+// deleteIfSet удаляет необязательную подписку (notification/delete —
+// могли не создаться в subscribe, тогда subID пуст) и, если она
+// вообще была, обновляет *err — но только если он ещё nil: первая
+// ошибка побеждает, остальные на её фоне уже не так важны, чтобы
+// затирать ими исходную причину.
+func (h *Hub) deleteIfSet(subID string, err *error) {
+	if subID == "" {
+		return
+	}
+	if e := h.subs.DeleteSubscription(subID); e != nil && *err == nil {
+		*err = e
+	}
 }

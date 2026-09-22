@@ -59,8 +59,9 @@ type sidebar struct {
 	// avatarsInFlight — какие каналы (по ID) уже в процессе загрузки
 	// аватарки прямо сейчас. Без этого повторный reload (пока первая
 	// загрузка ещё не завершилась) запустил бы вторую параллельную
-	// загрузку той же самой картинки.
-	avatarsInFlight map[string]bool
+	// загрузку той же самой картинки. См. pendingSet/fetchOnce в
+	// asyncfetch.go — общий приём, тот же и для бейджей в chatpane.go.
+	avatarsInFlight pendingSet
 }
 
 // setShowAvatars переключает показ аватарок в списке каналов (см.
@@ -78,7 +79,7 @@ func newSidebar(fetchAvatar ImageFetcher, status statusReporter, onChannelOpened
 		onChannelOpened:    onChannelOpened,
 		onChannelActivated: onChannelActivated,
 		onChannelRemoved:   onChannelRemoved,
-		avatarsInFlight:    make(map[string]bool),
+		avatarsInFlight:    make(pendingSet),
 	}
 }
 
@@ -108,36 +109,33 @@ func (s *sidebar) reload() {
 // ensureAvatar запускает загрузку аватарки канала, если её ещё нет в
 // кэше модели и она прямо сейчас не грузится. Сеть — в отдельной
 // горутине (fetchAvatar — блокирующий HTTP-запрос), применение к
-// модели — через Synchronize.
+// модели — через Synchronize (см. fetchOnce в asyncfetch.go).
 func (s *sidebar) ensureAvatar(channel domain.Channel) {
-	if channel.AvatarURL == "" || s.fetchAvatar == nil {
+	if channel.AvatarURL == "" || s.fetchAvatar == nil || s.model.hasAvatar(channel.ID) {
 		return
 	}
-	if s.model.hasAvatar(channel.ID) || s.avatarsInFlight[channel.ID] {
-		return
-	}
-	s.avatarsInFlight[channel.ID] = true
 
-	go func() {
-		img, err := s.fetchAvatar(channel.AvatarURL)
-
-		s.window.Synchronize(func() {
-			delete(s.avatarsInFlight, channel.ID)
-
+	fetchOnce(s.window, s.avatarsInFlight, channel.ID,
+		fmt.Sprintf("аватар канала %s:", channel.Name),
+		func() (apply func(), err error) {
+			img, err := s.fetchAvatar(channel.AvatarURL)
 			if err != nil {
-				log.Printf("аватар канала %s: %v", channel.Name, err)
-				return
+				return nil, err
 			}
 
-			icon, err := toSidebarIcon(img)
-			if err != nil {
-				log.Printf("аватар канала %s: %v", channel.Name, err)
-				return
-			}
-
-			s.model.setAvatar(channel.ID, icon)
+			// toSidebarIcon — это в итоге walk.NewBitmapFromImage, GDI-
+			// вызов: как и в оригинале до рефакторинга, оставляем его
+			// внутри apply (UI-поток, вызывается уже после Synchronize
+			// в fetchOnce), а не здесь, в фоновой горутине.
+			return func() {
+				icon, err := toSidebarIcon(img)
+				if err != nil {
+					log.Printf("аватар канала %s: %v", channel.Name, err)
+					return
+				}
+				s.model.setAvatar(channel.ID, icon)
+			}, nil
 		})
-	}()
 }
 
 // selectChannel выделяет канал в списке по ID и делает его активным.

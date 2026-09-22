@@ -79,14 +79,16 @@ type eventSubEnvelope struct {
 	} `json:"payload"`
 }
 
-// decodeChatMessage превращает payload.event уведомления
-// channel.chat.message в domain.ChatMessage. Возвращает отдельно
-// broadcaster_user_id — по нему Hub находит, какому каналу
-// адресовано сообщение.
-func decodeChatMessage(env eventSubEnvelope) (domain.ChatMessage, string, error) {
+// decodeCommonFields разбирает то, что общее у channel.chat.message и
+// channel.chat.notification — один и тот же payload.event (см.
+// eventSubEnvelope выше), одинаковые имена полей автора/канала/бейджей
+// что там, что там. ok=false при отсутствующем broadcaster_user_id —
+// тот же признак "событие отбрасываем целиком", что раньше был отдельно
+// продублирован в обеих decode-функциях.
+func decodeCommonFields(env eventSubEnvelope) (msg domain.ChatMessage, broadcasterID string, ok bool) {
 	e := env.Payload.Event
 	if e.BroadcasterUserID == "" {
-		return domain.ChatMessage{}, "", fmt.Errorf("missing broadcaster_user_id")
+		return domain.ChatMessage{}, "", false
 	}
 
 	badges := make([]domain.Badge, 0, len(e.Badges))
@@ -94,82 +96,72 @@ func decodeChatMessage(env eventSubEnvelope) (domain.ChatMessage, string, error)
 		badges = append(badges, domain.Badge{Name: b.SetID, Version: b.ID})
 	}
 
-	var replyTo *domain.ReplyTo
+	msg = domain.ChatMessage{
+		ID: e.MessageID,
+		Channel: domain.Channel{
+			ID:          e.BroadcasterUserID,
+			Name:        e.BroadcasterUserLogin,
+			DisplayName: e.BroadcasterUserName,
+		},
+		Author: domain.User{
+			ID:          e.ChatterUserID,
+			Login:       e.ChatterUserLogin,
+			DisplayName: e.ChatterUserName,
+			Color:       e.Color,
+		},
+		// Text — общее поле payload.event.message.text, но что оно
+		// значит — уже зависит от вызывающей стороны: для
+		// channel.chat.message это сам текст сообщения, для
+		// channel.chat.notification — то, что подписчик написал вместе
+		// с событием (например, комментарий к ресабу), часто пусто.
+		Text:   e.Message.Text,
+		Badges: badges,
+		SentAt: parseSentAt(env.Metadata.MessageTimestamp),
+	}
+
+	return msg, e.BroadcasterUserID, true
+}
+
+// decodeChatMessage превращает payload.event уведомления
+// channel.chat.message в domain.ChatMessage. Возвращает отдельно
+// broadcaster_user_id — по нему Hub находит, какому каналу
+// адресовано сообщение.
+func decodeChatMessage(env eventSubEnvelope) (domain.ChatMessage, string, error) {
+	msg, broadcasterID, ok := decodeCommonFields(env)
+	if !ok {
+		return domain.ChatMessage{}, "", fmt.Errorf("missing broadcaster_user_id")
+	}
+
+	e := env.Payload.Event
+
 	if e.Reply != nil {
-		replyTo = &domain.ReplyTo{
+		msg.ReplyTo = &domain.ReplyTo{
 			MessageID:   e.Reply.ParentMessageID,
 			AuthorLogin: e.Reply.ParentUserLogin,
 			AuthorName:  e.Reply.ParentUserName,
 			Text:        e.Reply.ParentMessage,
 		}
 	}
+	msg.Highlighted = e.MessageType == "channel_points_highlighted"
 
-	msg := domain.ChatMessage{
-		ID: e.MessageID,
-		Channel: domain.Channel{
-			ID:          e.BroadcasterUserID,
-			Name:        e.BroadcasterUserLogin,
-			DisplayName: e.BroadcasterUserName,
-		},
-		Author: domain.User{
-			ID:          e.ChatterUserID,
-			Login:       e.ChatterUserLogin,
-			DisplayName: e.ChatterUserName,
-			Color:       e.Color,
-		},
-		Text:        e.Message.Text,
-		Badges:      badges,
-		SentAt:      parseSentAt(env.Metadata.MessageTimestamp),
-		ReplyTo:     replyTo,
-		Highlighted: e.MessageType == "channel_points_highlighted",
-	}
-
-	return msg, e.BroadcasterUserID, nil
+	return msg, broadcasterID, nil
 }
 
 // decodeChatNotification превращает payload.event уведомления
 // channel.chat.notification (подписка, подарок подписки, рейд,
 // объявление и т.п. — EventSub USERNOTICE-замена) в domain.ChatMessage
-// с заполненным SystemMessage. Поля автора/бейджей — те же самые
-// имена, что и у channel.chat.message (общий Event выше), Text и
-// ReplyTo/Highlighted тут не при делах — уведомление не является ни
-// ответом, ни оплаченным за баллы обычным сообщением.
+// с заполненным SystemMessage. ReplyTo/Highlighted тут не при делах —
+// уведомление не является ни ответом, ни оплаченным за баллы обычным
+// сообщением, поэтому в decodeCommonFields их и нет вовсе.
 func decodeChatNotification(env eventSubEnvelope) (domain.ChatMessage, string, error) {
-	e := env.Payload.Event
-	if e.BroadcasterUserID == "" {
+	msg, broadcasterID, ok := decodeCommonFields(env)
+	if !ok {
 		return domain.ChatMessage{}, "", fmt.Errorf("missing broadcaster_user_id")
 	}
 
-	badges := make([]domain.Badge, 0, len(e.Badges))
-	for _, b := range e.Badges {
-		badges = append(badges, domain.Badge{Name: b.SetID, Version: b.ID})
-	}
+	msg.SystemMessage = env.Payload.Event.SystemMessage
 
-	msg := domain.ChatMessage{
-		ID: e.MessageID,
-		Channel: domain.Channel{
-			ID:          e.BroadcasterUserID,
-			Name:        e.BroadcasterUserLogin,
-			DisplayName: e.BroadcasterUserName,
-		},
-		Author: domain.User{
-			ID:          e.ChatterUserID,
-			Login:       e.ChatterUserLogin,
-			DisplayName: e.ChatterUserName,
-			Color:       e.Color,
-		},
-		// Text — то, что сам подписчик написал вместе с событием (например,
-		// комментарий к ресабу) — приходит в том же поле event.message, что
-		// и у обычных сообщений (общий Event на оба типа, см. выше). Часто
-		// пусто (не все события это поддерживают/не все заполняют) — тогда
-		// строка целиком превращается в один SystemMessage без остатка.
-		Text:          e.Message.Text,
-		Badges:        badges,
-		SentAt:        parseSentAt(env.Metadata.MessageTimestamp),
-		SystemMessage: e.SystemMessage,
-	}
-
-	return msg, e.BroadcasterUserID, nil
+	return msg, broadcasterID, nil
 }
 
 // decodeMessageDelete превращает payload.event удаления сообщения

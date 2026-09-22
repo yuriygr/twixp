@@ -80,7 +80,7 @@ deps:
 	@if [ ! -d $(GOPATH_XP)/src/gopkg.in/Knetic/govaluate.v3 ]; then \
 		git clone --quiet https://github.com/Knetic/govaluate.git $(GOPATH_XP)/src/gopkg.in/Knetic/govaluate.v3; \
 	fi
-	@ln -sfn $(CURDIR) $(GOPATH_XP)/src/twitchclient
+	@ln -sfn $(CURDIR) $(GOPATH_XP)/src/twixp
 	@echo "GOPATH_XP готов: $(GOPATH_XP)"
 
 # Быстрая проверка, что main.go/internal/ui компилируются и линкуются в
@@ -93,11 +93,11 @@ check: deps
 		echo "Нет config.go — скопируйте config.go.example в config.go и впишите свой Twitch Client ID."; \
 		exit 1; \
 	}
-	cd $(GOPATH_XP)/src/twitchclient && \
+	cd $(GOPATH_XP)/src/twixp && \
 	GOPATH=$(GOPATH_XP) GO111MODULE=off GOOS=windows GOARCH=386 \
 		$(GO) vet .
 	@mkdir -p $(BIN_DIR)
-	cd $(GOPATH_XP)/src/twitchclient && \
+	cd $(GOPATH_XP)/src/twixp && \
 	GOPATH=$(GOPATH_XP) GO111MODULE=off GOOS=windows GOARCH=386 \
 		$(GO) build -ldflags="-H windowsgui" -o $(CURDIR)/$(BIN_DIR)/twixp-check.exe .
 	@echo "check: собралось текущим Go для GOOS=windows/386 — $(BIN_DIR)/twixp-check.exe"
@@ -119,7 +119,7 @@ build: deps
 		exit 1; \
 	}
 	@mkdir -p $(BIN_DIR)
-	cd $(GOPATH_XP)/src/twitchclient && \
+	cd $(GOPATH_XP)/src/twixp && \
 	GOPATH=$(GOPATH_XP) GO111MODULE=off GOOS=windows GOARCH=386 \
 		$(GO_XP) build -ldflags="-H windowsgui" -o $(CURDIR)/$(BIN_DIR)/twixp.exe .
 	@echo "Готово: $(BIN_DIR)/twixp.exe"

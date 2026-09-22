@@ -91,10 +91,10 @@ type chatPane struct {
 	badgeURLs map[string]map[domain.Badge]string
 	// badgeURLsInFlight — какие каналы (по ID) прямо сейчас в процессе
 	// первой загрузки каталога — тот же приём, что avatarsInFlight в
-	// sidebar.go, и по той же причине: без него повторный reload успел
-	// бы запустить вторую параллельную загрузку одного и того же
-	// каталога.
-	badgeURLsInFlight map[string]bool
+	// sidebar.go: см. pendingSet/fetchOnce в asyncfetch.go. Без него
+	// повторный reload успел бы запустить вторую параллельную загрузку
+	// одного и того же каталога.
+	badgeURLsInFlight pendingSet
 
 	// globalBadges — общий для всех каналов каталог (модератор, Prime,
 	// турбо и т.п. — одна и та же картинка везде), загружается один раз
@@ -113,7 +113,7 @@ type chatPane struct {
 	badgeIcons map[string]*walk.Bitmap
 	// badgeIconsInFlight — тот же приём, что badgeURLsInFlight, только
 	// для отдельных иконок, а не каталога целиком.
-	badgeIconsInFlight map[string]bool
+	badgeIconsInFlight pendingSet
 
 	// displayedChannelID — какой канал сейчас реально показан в view.
 	// Единственный источник правды об этом (раньше appendMessage
@@ -169,9 +169,9 @@ func newChatPane(status statusReporter, fetchIcon ImageFetcher) *chatPane {
 		history:             make(map[string][]chatLine),
 		watching:            make(map[string]bool),
 		badgeURLs:           make(map[string]map[domain.Badge]string),
-		badgeURLsInFlight:   make(map[string]bool),
+		badgeURLsInFlight:   make(pendingSet),
 		badgeIcons:          make(map[string]*walk.Bitmap),
-		badgeIconsInFlight:  make(map[string]bool),
+		badgeIconsInFlight:  make(pendingSet),
 		chatters:            make(map[string]map[string]domain.User),
 		mentionStart:        -1,
 		mentionAutocomplete: true,
@@ -301,40 +301,54 @@ func (p *chatPane) ensureWatching(channel domain.Channel) {
 // ensureBadgeCatalog запускает загрузку каталога бейджей канала, если
 // его ещё нет в кэше и он прямо сейчас не грузится — тот же приём, что
 // sidebar.ensureAvatar для аватарок: сеть в отдельной горутине,
-// применение — через Synchronize.
+// применение — через Synchronize (см. fetchOnce в asyncfetch.go).
 func (p *chatPane) ensureBadgeCatalog(channel domain.Channel) {
 	if p.badgeCatalog == nil {
 		return
 	}
-	if _, ok := p.badgeURLs[channel.ID]; ok || p.badgeURLsInFlight[channel.ID] {
+	if _, ok := p.badgeURLs[channel.ID]; ok {
 		return
 	}
-	p.badgeURLsInFlight[channel.ID] = true
 
-	go func() {
-		catalog, err := p.badgeCatalog(channel)
-
-		p.window.Synchronize(func() {
-			delete(p.badgeURLsInFlight, channel.ID)
-
+	fetchOnce(p.window, p.badgeURLsInFlight, channel.ID,
+		fmt.Sprintf("бейджи канала %s:", channel.Name),
+		func() (apply func(), err error) {
+			catalog, err := p.badgeCatalog(channel)
 			if err != nil {
-				log.Printf("бейджи канала %s: %v", channel.Name, err)
-				return
+				return nil, err
 			}
-			p.badgeURLs[channel.ID] = catalog
 
-			// Сообщения могли прийти и уже отрисоваться раньше, чем
-			// подтянулся каталог этого канала — без пересчёта их бейджи
-			// так и остались бы пустыми местами до следующего
-			// переключения на этот чат. Если он показан прямо сейчас,
-			// пересчитываем (false — не прыгать в низ, см.
-			// chatView.setLines); неактивные каналы просто досчитаются
-			// сами в showChannel/setLines при следующем выборе.
-			if p.displayedChannelID == channel.ID {
-				p.view.setLines(p.history[channel.ID], false)
-			}
+			return func() {
+				p.badgeURLs[channel.ID] = catalog
+
+				// Сообщения могли прийти и уже отрисоваться раньше, чем
+				// подтянулся каталог этого канала — без пересчёта их
+				// бейджи так и остались бы пустыми местами до следующего
+				// переключения на этот чат. Если он показан прямо
+				// сейчас — пересчитываем; неактивные каналы просто
+				// досчитаются сами в showChannel/setLines при следующем
+				// выборе.
+				if p.displayedChannelID == channel.ID {
+					p.recomputeDisplayedChannel()
+				}
+			}, nil
 		})
-	}()
+}
+
+// recomputeDisplayedChannel пересчитывает раскладку показанного сейчас
+// канала без прыжка скролла вниз — false у chatView.setLines. Общий
+// хвост у ensureBadgeCatalog/ensureBadgeIcon: оба догружают что-то
+// асинхронно уже после того, как соответствующие строки могли успеть
+// отрисоваться без этого (бейдж/иконка — пустым местом до следующего
+// сообщения). Именно false и есть причина, по которой у setLines
+// вообще появился этот параметр: иконки бейджей догружаются часто, и
+// раньше каждая такая догрузка выдёргивала бы читающего историю
+// пользователя вниз.
+func (p *chatPane) recomputeDisplayedChannel() {
+	if p.displayedChannelID == "" {
+		return
+	}
+	p.view.setLines(p.history[p.displayedChannelID], false)
 }
 
 // watchMessages читает сообщения одного канала на всё время его жизни
@@ -535,47 +549,42 @@ func (p *chatPane) badgeImageURL(badge domain.Badge) string {
 }
 
 // ensureBadgeIcon запускает загрузку иконки бейджа по URL, если она ещё
+// ensureBadgeIcon запускает загрузку иконки бейджа по URL, если она ещё
 // не скачана и прямо сейчас не грузится — тот же приём, что
 // sidebar.ensureAvatar. Кэш общий на все каналы (см. badgeIcons) —
 // одна и та же глобальная иконка не тянется по новой для каждого
 // открытого чата.
 func (p *chatPane) ensureBadgeIcon(imageURL string) {
-	if p.fetchIcon == nil || p.badgeIconsInFlight[imageURL] {
+	if p.fetchIcon == nil {
 		return
 	}
-	p.badgeIconsInFlight[imageURL] = true
 
-	go func() {
-		img, err := p.fetchIcon(imageURL)
-
-		p.window.Synchronize(func() {
-			delete(p.badgeIconsInFlight, imageURL)
-
+	fetchOnce(p.window, p.badgeIconsInFlight, imageURL, "иконка бейджа:",
+		func() (apply func(), err error) {
+			img, err := p.fetchIcon(imageURL)
 			if err != nil {
-				log.Println("иконка бейджа:", err)
-				return
+				return nil, err
 			}
 
-			icon, err := walk.NewBitmapFromImage(img)
-			if err != nil {
-				log.Println("иконка бейджа:", err)
-				return
-			}
-			p.badgeIcons[imageURL] = icon
+			// walk.NewBitmapFromImage — GDI-вызов: как и в оригинале до
+			// рефакторинга, оставляем его внутри apply (UI-поток), а не
+			// здесь, в фоновой горутине.
+			return func() {
+				icon, err := walk.NewBitmapFromImage(img)
+				if err != nil {
+					log.Println("иконка бейджа:", err)
+					return
+				}
+				p.badgeIcons[imageURL] = icon
 
-			// Строка, из-за которой запустилась эта загрузка, уже могла
-			// отрисоваться без иконки (resolveBadge вернул nil выше) —
-			// пересчитываем показанный сейчас канал, чтобы бейдж не
-			// провисел пустым местом до следующего сообщения. false — не
-			// прыгать в низ (см. chatView.setLines) — именно та самая
-			// причина, из-за которой этот параметр вообще понадобился:
-			// иконки бейджей догружаются часто, и раньше каждая такая
-			// догрузка выдёргивала бы читающего историю пользователя вниз.
-			if p.displayedChannelID != "" {
-				p.view.setLines(p.history[p.displayedChannelID], false)
-			}
+				// Строка, из-за которой запустилась эта загрузка, уже
+				// могла отрисоваться без иконки (resolveBadge вернул nil
+				// выше) — пересчитываем показанный сейчас канал, чтобы
+				// бейдж не провисел пустым местом до следующего
+				// сообщения (см. recomputeDisplayedChannel).
+				p.recomputeDisplayedChannel()
+			}, nil
 		})
-	}()
 }
 
 // startReply включает режим ответа на сообщение — коллбэк из

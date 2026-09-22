@@ -21,6 +21,8 @@ import (
 // зависимости через конструкторы в New(), сюда нужны только их
 // AssignTo-указатели для declarative-дерева.
 func buildChatPage(m *MainWindow) pageFactory {
+	// Думаю так будет удобнее
+	defaultMargins := declarative.Margins{Left: 2, Top: 2, Right: 2, Bottom: 2}
 	return func(parent walk.Container) (*walk.Composite, error) {
 		var root *walk.Composite
 
@@ -34,10 +36,7 @@ func buildChatPage(m *MainWindow) pageFactory {
 					Layout:  declarative.VBox{MarginsZero: true, SpacingZero: true},
 					Children: []declarative.Widget{
 						declarative.Composite{
-							// Небольшой отступ (пара пикселей) — без него
-							// кнопка утыкается прямо в край окна, выглядит
-							// некрасиво.
-							Layout: declarative.HBox{Margins: declarative.Margins{Left: 2, Top: 2, Right: 2, Bottom: 2}},
+							Layout: declarative.HBox{Margins: defaultMargins},
 							Children: []declarative.Widget{
 								declarative.PushButton{
 									AssignTo:  &m.sidebar.addChannelBtn,
@@ -67,10 +66,7 @@ func buildChatPage(m *MainWindow) pageFactory {
 							},
 						},
 						declarative.Composite{
-							// Тот же отступ, что и у "Добавить канал" сверху —
-							// просто симметрично, без специальной причины
-							// именно под таким же значением.
-							Layout: declarative.HBox{Margins: declarative.Margins{Left: 2, Top: 2, Right: 2, Bottom: 2}},
+							Layout: declarative.HBox{Margins: defaultMargins},
 							Children: []declarative.Widget{
 								declarative.PushButton{
 									Text: "Настройки",
@@ -112,7 +108,7 @@ func buildChatPage(m *MainWindow) pageFactory {
 						declarative.Composite{
 							AssignTo: &m.chatPane.replyBanner,
 							Visible:  false,
-							Layout:   declarative.HBox{Margins: declarative.Margins{Left: 2, Top: 2, Right: 2, Bottom: 2}},
+							Layout:   declarative.HBox{Margins: defaultMargins},
 							Children: []declarative.Widget{
 								declarative.Label{
 									AssignTo: &m.chatPane.replyLabel,
@@ -125,10 +121,7 @@ func buildChatPage(m *MainWindow) pageFactory {
 							},
 						},
 						declarative.Composite{
-							// Небольшой отступ (пара пикселей) — без него
-							// кнопка "Отправить" утыкается прямо в край
-							// окна, выглядит некрасиво.
-							Layout: declarative.HBox{Margins: declarative.Margins{Left: 2, Top: 2, Right: 2, Bottom: 2}},
+							Layout: declarative.HBox{Margins: defaultMargins},
 							Children: []declarative.Widget{
 								declarative.LineEdit{
 									AssignTo:      &m.chatPane.input,

@@ -238,8 +238,9 @@ func (m *MainWindow) build() error {
 		AssignTo: &m.window,
 		Icon:     icon,
 		Title:    "TwiXP",
-		// 800x480 — экран Eee PC 701, конечной цели этого клиента.
-		Size:    declarative.Size{Width: 800, Height: 480},
+		// Вместо прежнего разрешения 800x480 сделал поменьше чтобы при открытии
+		// окна на EEEPC окно не выезжало за пределы
+		Size:    declarative.Size{Width: 760, Height: 440},
 		MinSize: declarative.Size{Width: 480, Height: 320},
 		Layout:  declarative.VBox{MarginsZero: true, SpacingZero: true},
 		StatusBarItems: []declarative.StatusBarItem{
