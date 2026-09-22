@@ -8,8 +8,6 @@ import (
 	"log"
 	"sort"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
@@ -428,14 +426,16 @@ func (p *chatPane) appendMessage(channelID string, msg domain.ChatMessage) {
 	// "@viewer" в начале — самое настоящее упоминание, и оно не должно
 	// пропасть просто из-за того, что мы прячем его из отображаемого
 	// текста (см. stripReplyMentionPrefix).
-	mentioned := isMentioned(msg.Text, p.viewer)
+	mentioned := domain.IsMentioned(msg.Text, p.viewer)
+
+	nc := domain.NicknameColor(msg.Author.ID, msg.Author.Login, msg.Author.Color)
 
 	line := chatLine{
 		Time:          msg.SentAt,
 		Author:        msg.Author.DisplayName,
 		MessageID:     msg.ID,
-		Color:         nicknameColor(msg.Author.ID, msg.Author.Login, msg.Author.Color),
-		Text:          stripReplyMentionPrefix(msg.Text, msg.ReplyTo),
+		Color:         walk.RGB(nc.R, nc.G, nc.B),
+		Text:          domain.StripReplyMentionPrefix(msg.Text, msg.ReplyTo),
 		Mentioned:     mentioned,
 		Badges:        msg.Badges,
 		ReplyTo:       msg.ReplyTo,
@@ -585,7 +585,7 @@ func (p *chatPane) startReply(line chatLine) {
 	l := line
 	p.replyTo = &l
 
-	p.replyLabel.SetText(fmt.Sprintf("Ответ %s: %s", line.Author, truncateRunes(line.Text, 60)))
+	p.replyLabel.SetText(fmt.Sprintf("Ответ %s: %s", line.Author, domain.TruncateRunes(line.Text, 60)))
 	p.replyBanner.SetVisible(true)
 	p.input.SetFocus()
 }
@@ -597,96 +597,6 @@ func (p *chatPane) cancelReply() {
 
 func (p *chatPane) onCancelReplyClicked() {
 	p.cancelReply()
-}
-
-// truncateRunes обрезает строку до max рун (а не байт — русский текст
-// не должен разваливаться на середине буквы), добавляя многоточие,
-// если что-то отрезано.
-func truncateRunes(s string, max int) string {
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max]) + "…"
-}
-
-// isMentioned сообщает, упоминает ли текст сообщения viewer'а через
-// "@логин" или "@ОтображаемоеИмя" — так Twitch сам подсвечивает
-// упоминания в вебе, и веб-клиент, откликаясь на клик по нику, вставляет
-// именно один из этих двух вариантов. Пустой viewer.Login (до входа
-// или пока viewer ещё не выставлен) — сигнал "сравнивать не с чем",
-// сообщение никогда не считается упоминанием.
-func isMentioned(text string, viewer domain.User) bool {
-	if viewer.Login == "" {
-		return false
-	}
-
-	for _, word := range strings.Fields(text) {
-		if !strings.HasPrefix(word, "@") {
-			continue
-		}
-		// Обрезаем случайную пунктуацию по краям ("@логин," "@логин:" и
-		// т.п.) — просто хвостовой знак препинания в предложении не
-		// должен мешать сравнению.
-		name := strings.TrimFunc(word[len("@"):], func(r rune) bool {
-			return !isMentionRune(r)
-		})
-		if name == "" {
-			continue
-		}
-		if strings.EqualFold(name, viewer.Login) {
-			return true
-		}
-		if viewer.DisplayName != "" && strings.EqualFold(name, viewer.DisplayName) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// isMentionRune — допустимый символ внутри логина/отображаемого имени
-// для целей isMentioned: буквы, цифры, подчёркивание. Не обязан в
-// точности повторять реальные правила Twitch на допустимые логины —
-// нужен только чтобы отличить "@логин" от "@логин," и не более того.
-func isMentionRune(r rune) bool {
-	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
-}
-
-// stripReplyMentionPrefix убирает начальный "@Автор " из текста
-// ответа. Twitch сам добавляет такой префикс в текст ЛЮБОГО ответа
-// (msg.ReplyTo != nil — надёжное тому подтверждение, а не догадка по
-// содержимому) — раз кому отвечали, теперь показывается отдельной
-// серой строкой сверху (см. chatLine.ReplyTo, chatView.layoutLine),
-// повторять то же самое ещё и в начале текста незачем.
-//
-// Вызывается ПОСЛЕ isMentioned (см. appendMessage), не до: если
-// родитель сообщения — сам viewer, "@viewer" в начале обязан остаться
-// настоящим упоминанием при подсчёте Mentioned, а не исчезнуть вместе
-// с этой чисто отображательной обрезкой.
-func stripReplyMentionPrefix(text string, reply *domain.ReplyTo) string {
-	if reply == nil || reply.AuthorLogin == "" {
-		return text
-	}
-
-	prefix := "@" + reply.AuthorLogin
-	if !strings.HasPrefix(strings.ToLower(text), strings.ToLower(prefix)) {
-		return text
-	}
-
-	rest := text[len(prefix):]
-	if rest != "" {
-		r, size := utf8.DecodeRuneInString(rest)
-		if !unicode.IsSpace(r) {
-			// Дальше идут ещё буквы/цифры того же слова — то есть это
-			// более длинный ник, случайно начинающийся с тех же
-			// символов, а не искомое "@Автор" целиком.
-			return text
-		}
-		rest = rest[size:]
-	}
-
-	return strings.TrimLeft(rest, " ")
 }
 
 // onSendClicked/onInputKeyDown — отправка сообщения. Send — тоже
@@ -754,7 +664,7 @@ func (p *chatPane) onInputTextChanged() {
 	text := []rune(p.input.Text())
 	caret, _ := p.input.TextSelection()
 
-	token, start, ok := mentionTokenBefore(text, caret)
+	token, start, ok := domain.MentionTokenBefore(text, caret)
 	if !ok {
 		p.closeMentionPopup()
 		return
@@ -774,37 +684,6 @@ func (p *chatPane) onInputTextChanged() {
 
 	p.mentionStart = start
 	p.mentionPopup.show(p.input.Handle(), matches, p.commitMention)
-}
-
-// mentionTokenBefore ищет незакрытое "@токен" непосредственно перед
-// caret (в рунах — см. onInputTextChanged, почему не в байтах).
-// "Незакрытое" — значит caret стоит сразу после последней буквы токена,
-// без пробела между ними: "@ivan|" (| — курсор) даёт token="ivan",
-// а "@ivan |" уже нет (пробел завершил токен, дальше это просто текст).
-//
-// "@" засчитывается только в начале сообщения или после пробела —
-// иначе "text@example.com" тоже попал бы под автодополнение, а это
-// обычный текст, не упоминание.
-func mentionTokenBefore(text []rune, caret int) (token string, start int, ok bool) {
-	if caret < 0 || caret > len(text) {
-		return "", 0, false
-	}
-
-	i := caret
-	for i > 0 && isMentionRune(text[i-1]) {
-		i--
-	}
-
-	if i == 0 || text[i-1] != '@' {
-		return "", 0, false
-	}
-	atPos := i - 1
-
-	if atPos > 0 && !unicode.IsSpace(text[atPos-1]) {
-		return "", 0, false
-	}
-
-	return string(text[i:caret]), atPos, true
 }
 
 // matchChatters отдаёт до maxMentionMatches подходящих под token

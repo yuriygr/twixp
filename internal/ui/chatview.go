@@ -5,8 +5,6 @@ package ui
 
 import (
 	"fmt"
-	"hash/fnv"
-	"strconv"
 	"syscall"
 	"time"
 	"unsafe"
@@ -21,8 +19,8 @@ import (
 // виде: только то, что нужно для отрисовки и для действий контекстного
 // меню (Ответить/Скопировать). chatView ничего не знает про
 // domain.ChatMessage напрямую — цвет ника, текст времени и признак
-// упоминания уже посчитаны на стороне chatPane (см. nicknameColor,
-// isMentioned). Badges — исключение: сами domain.Badge (Name/Version)
+// упоминания уже посчитаны на стороне chatPane (см. domain.NicknameColor,
+// domain.IsMentioned). Badges — исключение: сами domain.Badge (Name/Version)
 // долетают как есть, отрисовку конкретной иконки chatView делает через
 // resolveBadge, а не готовым *walk.Bitmap в самой строке — так уже
 // показанные строки подхватывают иконку, догрузившуюся позже (см.
@@ -73,19 +71,6 @@ type chatLine struct {
 	Deleted bool
 }
 
-// defaultNickColors — палитра для зрителей, которые не задали себе
-// цвет ника в Twitch (Color == ""). Тот же набор из 15 цветов, что
-// использует сам веб-клиент Twitch в этом случае — так поведение не
-// выглядит придуманным нами произвольно, и цвет одного и того же
-// зрителя выглядит привычно тем, кто видел его в других клиентах.
-var defaultNickColors = []walk.Color{
-	walk.RGB(255, 0, 0), walk.RGB(0, 0, 255), walk.RGB(0, 255, 0),
-	walk.RGB(178, 34, 34), walk.RGB(255, 127, 80), walk.RGB(154, 205, 50),
-	walk.RGB(255, 69, 0), walk.RGB(46, 139, 87), walk.RGB(218, 165, 32),
-	walk.RGB(210, 105, 30), walk.RGB(95, 158, 160), walk.RGB(30, 144, 255),
-	walk.RGB(255, 105, 180), walk.RGB(138, 43, 226), walk.RGB(0, 255, 127),
-}
-
 var (
 	timestampColor   = walk.RGB(128, 128, 128)
 	defaultTextColor = walk.RGB(0, 0, 0)
@@ -114,45 +99,6 @@ var (
 	unreadIndicatorColor     = walk.RGB(60, 120, 220)
 	unreadIndicatorTextColor = walk.RGB(255, 255, 255)
 )
-
-// nicknameColor — цвет ника для сообщения. Если у зрителя есть
-// собственный цвет в Twitch (пришёл прямо в EventSub-событии, см.
-// decodeChatMessage), используем его. Если нет — детерминированный
-// хеш от ID (или логина, если ID почему-то пуст) по палитре выше: без
-// единого сетевого запроса, и один и тот же зритель всегда получает
-// один и тот же цвет в рамках сессии (и не только — хеш от ID не
-// меняется между запусками).
-func nicknameColor(userID, login, twitchColor string) walk.Color {
-	if c, ok := parseHexColor(twitchColor); ok {
-		return c
-	}
-
-	key := userID
-	if key == "" {
-		key = login
-	}
-	if key == "" {
-		return defaultNickColors[0]
-	}
-
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(key))
-	return defaultNickColors[h.Sum32()%uint32(len(defaultNickColors))]
-}
-
-// parseHexColor разбирает цвет в формате Twitch ("#RRGGBB"). ok=false
-// для пустой строки (зритель цвет не задавал) или любого неожиданного
-// формата — вызывающий код в этом случае берёт цвет из палитры.
-func parseHexColor(s string) (walk.Color, bool) {
-	if len(s) != 7 || s[0] != '#' {
-		return 0, false
-	}
-	v, err := strconv.ParseUint(s[1:], 16, 32)
-	if err != nil {
-		return 0, false
-	}
-	return walk.RGB(byte(v>>16), byte(v>>8), byte(v)), true
-}
 
 // chatPad* — внутренние отступы. chatLineGap — вертикальный зазор
 // между сообщениями. approxLineHeight — грубая (не обязанная быть
@@ -205,21 +151,30 @@ const (
 // поменяться, а не один. Ещё сознательное ограничение: нет
 // выделения/копирования текста (то, что бесплатно давал бы TextEdit) —
 // если окажется важно на практике, отдельная задача.
+//
+// onMouseWheel ниже сам по себе срабатывает только пока фокус ввода на
+// самом chatView — вживую это почти никогда не так (обычно печатают в
+// поле сообщения), а Windows шлёт WM_MOUSEWHEEL именно окну с фокусом,
+// а не тому, что под курсором (см. MSDN, WM_MOUSEWHEEL). Настоящая
+// точка входа для колеса мыши — MainWindow.onMouseWheel (mainwindow.go):
+// туда сообщение попадает, поднявшись по цепочке родителей через
+// DefWindowProc, и оттуда явно перевызывается chatView.onMouseWheel,
+// если курсор сейчас над ним.
 type chatView struct {
 	widget *walk.CustomWidget
 
 	// origWndProc — оконная процедура, которую вернул
 	// walk/CreateWindowEx до сабклассинга (см. attach). Нужна, чтобы
-	// отдавать ей все сообщения, кроме WM_VSCROLL/WM_ERASEBKGND, через
-	// CallWindowProc — иначе виджет молча потерял бы всё остальное
-	// поведение walk.CustomWidget (отрисовку, мышь и т.д.).
+	// отдавать ей все сообщения, кроме WM_VSCROLL, через CallWindowProc
+	// — иначе виджет молча потерял бы всё остальное поведение
+	// walk.CustomWidget (отрисовку, мышь и т.д.).
 	origWndProc uintptr
 
 	// bgBrush — кисть фона, кэшированная один раз в attach() и
-	// переиспользуемая в paint() (см. подавление WM_ERASEBKGND там же)
-	// — не создаём GDI-объект заново на каждую перерисовку, это на
-	// слабом железе (Celeron ULV ~630МГц) не бесплатно, особенно на
-	// каждое новое сообщение в активном чате.
+	// переиспользуемая в paint() (там же и заливается — см. начало
+	// paint()) — не создаём GDI-объект заново на каждую перерисовку,
+	// это на слабом железе (Celeron ULV ~630МГц) не бесплатно, особенно
+	// на каждое новое сообщение в активном чате.
 	bgBrush walk.Brush
 
 	// mentionBrush — кисть для подсветки строк с упоминанием
@@ -812,16 +767,30 @@ func (v *chatView) updateScrollBar() {
 }
 
 // subclassWndProc перехватывает WM_VSCROLL нативного скроллбара —
-// клики по стрелкам/треку и перетаскивание ползунка — и WM_ERASEBKGND,
-// чтобы убрать мерцание истории на каждое новое сообщение (см.
-// подробности ниже). walk.CustomWidget в этой версии ничего не делает
-// с WM_VSCROLL и не публикует под него события, поэтому единственный
-// способ его получить — классический win32-сабклассинг: подменить
-// оконную процедуру именно этого hwnd на свою, всё остальное отдавая
-// оригиналу через CallWindowProc. Тот же приём, которым сам lxn/walk
-// сабклассит внутренние SysListView32 у TableView (см. vendor
-// lxn/walk, tableview.go, tableViewNormalLVWndProc) — известный, а не
-// придуманный с нуля способ.
+// клики по стрелкам/треку и перетаскивание ползунка. walk.CustomWidget
+// в этой версии ничего не делает с WM_VSCROLL и не публикует под него
+// события, поэтому единственный способ его получить — классический
+// win32-сабклассинг: подменить оконную процедуру именно этого hwnd на
+// свою, всё остальное отдавая оригиналу через CallWindowProc. Тот же
+// приём, которым сам lxn/walk сабклассит внутренние SysListView32 у
+// TableView (см. vendor lxn/walk, tableview.go,
+// tableViewNormalLVWndProc) — известный, а не придуманный с нуля
+// способ.
+//
+// WM_ERASEBKGND тут больше не перехватывается отдельно — раньше это
+// было нужно, чтобы решить проблему мерцания истории на каждое новое
+// сообщение (Invalidate() всегда просит перерисовать весь клиентский
+// прямоугольник целиком, и Windows перед WM_PAINT сама заливала бы его
+// фоном отдельным более ранним сообщением, оставляя пустой кадр видимым
+// до paint()). Теперь и это, и вторую половину той же проблемы (сам
+// paint() рисовал прямо в экранный HDC без буфера — на медленном
+// железе разрыв между стиранием фона и отрисовкой текста было видно
+// даже без WM_ERASEBKGND) закрывает PaintMode: declarative.PaintBuffered
+// у CustomWidget (см. page_chat.go) — offscreen-отрисовка с одним
+// BitBlt в конце, и WM_ERASEBKGND в этом режиме гасит сам walk (см.
+// customwidget.go: `if cw.paintMode != PaintNormal { return 1 }`).
+// Раньше выставленный здесь `return 1` был бы просто более ранним
+// дублем того же самого.
 //
 // Восстанавливать оригинальную процедуру на WM_NCDESTROY не нужно:
 // chatView не пересоздаётся и не меняет hwnd в течение жизни
@@ -829,29 +798,9 @@ func (v *chatView) updateScrollBar() {
 // framework может пересобирать) — сабкласс живёт ровно до закрытия
 // окна, вместе с самим процессом.
 func (v *chatView) subclassWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
-	switch msg {
-	case win.WM_VSCROLL:
+	if msg == win.WM_VSCROLL {
 		v.onVScroll(wParam)
 		return 0
-
-	case win.WM_ERASEBKGND:
-		// appendLine (новое сообщение) вызывает Invalidate(), которая
-		// (см. vendor lxn/walk, window.go — InvalidateRect(..., true))
-		// ВСЕГДА просит стереть фон, и ВСЕГДА для всего клиентского
-		// прямоугольника целиком, не только для новой строки. Без этой
-		// подмены Windows перед WM_PAINT сама заливает весь видимый
-		// текст фоном (WM_ERASEBKGND), и только отдельным, более
-		// поздним сообщением paint() рисует текст обратно — экран
-		// успевает показать пустой кадр между этими двумя сообщениями,
-		// отсюда и мерцание всей истории на каждое новое сообщение,
-		// хотя реально меняется только одна строка внизу.
-		//
-		// Возвращаем ненулевое значение — сигнал Windows, что фон уже
-		// стёрт (реально стирает paint() сам, одним проходом с
-		// отрисовкой текста — см. FillRectangle в начале paint()), так
-		// что отдельного стирания не будет вообще, а не просто "будет
-		// позже".
-		return 1
 	}
 
 	return win.CallWindowProc(v.origWndProc, hwnd, msg, wParam, lParam)
@@ -1115,21 +1064,9 @@ func bannerTextFor(line chatLine) (text string, ok bool) {
 		return "Использовано: Выделить моё сообщение", true
 	}
 	if line.ReplyTo != nil {
-		return replyLineText(line.ReplyTo), true
+		return domain.ReplyLineText(line.ReplyTo), true
 	}
 	return "", false
-}
-
-// replyLineText — текст серой строки над сообщением-ответом. Тот же
-// формат "Ответ Автору: текст", что уже использует replyBanner над
-// полем ввода (см. chatPane.startReply) — единообразно с тем, что
-// пользователь уже видел там, когда сам нажимал "Ответить".
-func replyLineText(reply *domain.ReplyTo) string {
-	author := reply.AuthorName
-	if author == "" {
-		author = reply.AuthorLogin
-	}
-	return "Ответ @" + author + ": " + truncateRunes(reply.Text, 60)
 }
 
 // layoutSystemMessage — упрощённая раскладка для системных уведомлений
@@ -1202,10 +1139,12 @@ func (v *chatView) layoutSystemMessage(canvas *walk.Canvas, font *walk.Font, lin
 // не стоит. updateBounds — уже ограниченная Windows-ом грязная
 // область; строки полностью выше или полностью ниже неё не рисуем.
 //
-// FillRectangle в начале — наша замена штатному WM_ERASEBKGND,
-// который подавлен в subclassWndProc: стираем фон ровно перед тем, как
-// рисовать текст, одним проходом, а не двумя разными сообщениями с
-// экраном между ними — см. подробное объяснение мерцания там же.
+// FillRectangle в начале — заливка фона одним проходом вместе с самим
+// текстом, а не отдельным более ранним WM_ERASEBKGND: PaintMode:
+// declarative.PaintBuffered (см. page_chat.go) гасит WM_ERASEBKGND сам
+// и рисует весь этот проход в offscreen-битмап, так что разрыв между
+// стиранием и текстом в принципе не виден на экране — см. подробности
+// у subclassWndProc.
 func (v *chatView) paint(canvas *walk.Canvas, updateBounds walk.Rectangle) error {
 	// Проверка "уже внизу?" — раньше отрисовки строк, а не после: не
 	// важно, каким путём scrollTop туда попал (колесо, скроллбар, клик

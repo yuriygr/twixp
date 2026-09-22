@@ -75,8 +75,13 @@ Windows на уровне сырых сообщений `WM_*`, и в итоге
 
 ```sh
 make vet-core   # go vet по ядру
+make test       # go test по ядру — пока покрыт только domain
 make fmt        # список неотформатированных файлов
 ```
+
+Оба таргета гоняются на каждый push/PR (см. `.github/workflows/ci.yml`) —
+без Windows, без GOPATH, без Go 1.10.8: обычный `go test` на обычном
+Go-модуле.
 
 Сам клиент (`main.go`, `internal/ui`) живёт в отдельном GOPATH-стиль
 окружении (`GO111MODULE=off`) с запиненными зависимостями:

@@ -91,6 +91,18 @@ func buildChatPage(m *MainWindow) pageFactory {
 						declarative.CustomWidget{
 							AssignTo: &m.chatPane.view.widget,
 							Paint:    m.chatPane.view.paint,
+							// PaintBuffered — paint() рисует не прямо в
+							// экранный HDC, а в offscreen-битмап, и walk
+							// сам одним BitBlt переносит готовый кадр на
+							// экран (см. bufferedPaint в vendor lxn/walk,
+							// customwidget.go). Без этого на каждое новое
+							// сообщение/скролл экран успевал показать
+							// кадр с уже стёртым, но ещё не дорисованным
+							// текстом — источник мерцания истории,
+							// отдельный от WM_ERASEBKGND (тот подавлен
+							// ниже, в subclassWndProc, и решает другую
+							// половину той же проблемы).
+							PaintMode: declarative.PaintBuffered,
 							// WS_VSCROLL — declarative.CustomWidget не
 							// даёт декларативного способа добавить
 							// скроллбар; chatView сам сабклассит

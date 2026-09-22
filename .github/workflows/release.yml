@@ -1,0 +1,64 @@
+# Релиз собирается по push git-тега вида v1.2.3 (см. Readme.md,
+# раздел "Релизы"). Версия в коде не хранится нигде — единственный
+# источник истины сам тег.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Установить текущий Go (нужен как bootstrap для go1.10.8)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Скачать настоящий Go 1.10.8
+        # golang.org/dl/go1.10.8 — официальный установщик конкретной
+        # версии от команды Go: сам качает SDK и сверяет его с
+        # официальными метаданными, руками sha256 вписывать не нужно.
+        run: |
+          go install golang.org/dl/go1.10.8@latest
+          "$(go env GOPATH)/bin/go1.10.8" download
+          echo "GO_XP=$(go env GOPATH)/bin/go1.10.8" >> "$GITHUB_ENV"
+
+      - name: Собрать config.go из секрета
+        # config.go не хранится в репозитории (см. .gitignore) — тот
+        # же Client ID, что при обычной локальной сборке, только
+        # взятый из GitHub Secret, а не из личного файла разработчика.
+        run: |
+          cat > config.go <<GOEOF
+          //go:build windows
+          // +build windows
+
+          package main
+
+          const clientID = "${{ secrets.TWITCH_CLIENT_ID }}"
+
+          var scopes = []string{"user:read:chat", "user:write:chat"}
+          GOEOF
+
+      - name: make build
+        run: make build GO_XP="$GO_XP"
+
+      - name: Назвать бинарник версией тега
+        run: cp bin/twixp.exe "bin/twixp-${GITHUB_REF_NAME}.exe"
+
+      - name: Опубликовать релиз
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "bin/twixp-${GITHUB_REF_NAME}.exe" \
+            --title "TwiXP $GITHUB_REF_NAME" \
+            --generate-notes

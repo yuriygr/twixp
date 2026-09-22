@@ -269,6 +269,10 @@ func (m *MainWindow) build() error {
 	// На сворачивание/восстановление окна — см. onMainWindowSizeChanged.
 	m.window.SizeChanged().Attach(m.onMainWindowSizeChanged)
 
+	// См. onMouseWheel — единственное место, где вообще нужно знать про
+	// колесо мыши на уровне всего окна, а не конкретного виджета.
+	m.window.MouseWheel().Attach(m.onMouseWheel)
+
 	if err := m.setupTrayIcon(icon); err != nil {
 		// Не фатально — просто не будет сворачивания в трей, крестик
 		// закроет приложение как обычно, безо всякого трея.
@@ -425,6 +429,47 @@ func (m *MainWindow) onMainWindowSizeChanged() {
 		m.redrawClientEdges()
 	}
 	m.wasMinimized = minimized
+}
+
+// onMouseWheel — единственная причина этого метода: Windows шлёт
+// WM_MOUSEWHEEL окну с ФОКУСОМ ВВОДА, а не тому, что под курсором (см.
+// MSDN, раздел Remarks у WM_MOUSEWHEEL — так исторически сложилось ещё
+// с 16-битных Windows). В этом приложении фокус почти всё время держит
+// поле ввода сообщения, а не chatView, — так что колесо мыши над
+// историей чата у chatView.onMouseWheel (см. chatview.go) само по себе
+// ни разу не сработает: событие достаётся полю ввода, которое его не
+// обрабатывает.
+//
+// Дальше начинает работать другая часть того же механизма: любое окно,
+// не обработавшее WM_MOUSEWHEEL, само передаёт его своему родителю
+// через DefWindowProc — так оно поднимается по цепочке родителей (поле
+// ввода → Composite-контейнеры → MainWindow), пока не найдётся то, что
+// его заберёт. MainWindow — вершина этой цепочки в нашем окне, сюда
+// сообщение долетает нетронутым, и здесь остаётся вручную решить,
+// относится ли оно к chatView (курсор сейчас над ним) — единственный
+// скроллящийся колесом виджет во всём приложении, второго такого места
+// пока нет и заводить общий "роутер" под это преждевременно.
+func (m *MainWindow) onMouseWheel(x, y int, button walk.MouseButton) {
+	view := m.chatPane.view
+	if view.widget == nil {
+		return // страница чата ещё не построена — сворачивать нечего
+	}
+
+	// x/y у WM_MOUSEWHEEL — координаты ЭКРАНА, а не клиентской области,
+	// в отличие от остальных мышиных сообщений (та же причина: раз
+	// сообщение в принципе может уйти в другое окно, координаты не
+	// имеют смысла быть относительными к какому-то одному из них) — see
+	// MSDN. Поэтому сравниваем прямо с GetWindowRect, без
+	// ScreenToClient.
+	var rect win.RECT
+	if !win.GetWindowRect(view.widget.Handle(), &rect) {
+		return
+	}
+	if x < int(rect.Left) || x >= int(rect.Right) || y < int(rect.Top) || y >= int(rect.Bottom) {
+		return // курсор не над chatView — это не наше колесо
+	}
+
+	view.onMouseWheel(x, y, button)
 }
 
 // redrawClientEdges — тот же самый вызов SetWindowPos с
