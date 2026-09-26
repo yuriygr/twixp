@@ -38,6 +38,13 @@ type chatPane struct {
 	view  *chatView
 	input *walk.LineEdit
 
+	// chatWidget — сам *walk.CustomWidget зоны чата, приходит сюда через
+	// AssignTo в declarative-дереве (см. page_chat.go) и дальше просто
+	// передаётся в view.attach(chatWidget) и наружу в mainwindow.go
+	// (redrawClientEdges) — так и AssignTo, и внешним пользователям не
+	// нужно лезть в chatPane.view.widget, внутреннее поле chatView.
+	chatWidget *walk.CustomWidget
+
 	// replyBanner/replyLabel — строка над полем ввода "Ответ Х: текст"
 	// с кнопкой отмены, видна только пока идёт ответ (см. startReply/
 	// cancelReply). AssignTo из declarative-дерева в build().
@@ -58,12 +65,25 @@ type chatPane struct {
 	// без ограничений.
 	history map[string][]chatLine
 
-	// watching — какие каналы (по ID) уже читаются постоянной
-	// горутиной watchMessages. У каждого открытого канала свой читатель
-	// на всё время его жизни, независимо от того, активен ли он сейчас
-	// — иначе сообщения неактивных каналов просто некому копить в
-	// history.
-	watching map[string]bool
+	// watching — по каждому открытому каналу: номер поколения активного
+	// watchMessages (0 — нет активного читателя; отсутствие ключа даёт
+	// тот же 0 по умолчанию, так что оба случая проверяются одним
+	// сравнением, см. watchMessages). Каждый ensureWatching для канала
+	// без активного читателя увеличивает nextWatchGen и запускает новую
+	// горутину именно с этим номером; watchMessages в конце удаляет
+	// свою запись только если она СОВПАДАЕТ с номером, с которым эта
+	// горутина была запущена — иначе более новый читатель (уже
+	// запущенный для того же канала, пока прежняя горутина ещё
+	// дочитывала закрывающийся канал) потерял бы свою запись из-за
+	// куда более старой, просто отставшей горутины. Классический приём
+	// против ABA — одного bool тут недостаточно: быстрое "закрыть
+	// канал → сразу открыть тот же самый" создаёт ровно такую гонку.
+	watching map[string]uint64
+
+	// nextWatchGen — счётчик для watching. Общий на все каналы (не
+	// нужно по счётчику на канал — важна уникальность среди ВСЕХ
+	// когда-либо запущенных читателей, а не в рамках одного канала).
+	nextWatchGen uint64
 
 	// viewer — авторизованный пользователь. Используется только для
 	// подсветки сообщений с упоминанием (см. isMentioned) — нулевое
@@ -167,7 +187,7 @@ func newChatPane(status statusReporter, fetchIcon ImageFetcher) *chatPane {
 		status:              status,
 		fetchIcon:           fetchIcon,
 		history:             make(map[string][]chatLine),
-		watching:            make(map[string]bool),
+		watching:            make(map[string]uint64),
 		badgeURLs:           make(map[string]map[domain.Badge]string),
 		badgeURLsInFlight:   make(pendingSet),
 		badgeIcons:          make(map[string]*walk.Bitmap),
@@ -184,8 +204,27 @@ func newChatPane(status statusReporter, fetchIcon ImageFetcher) *chatPane {
 // нужно только после того, как у главного окна появился настоящий hwnd
 // (см. chatpage.go, там же, где chatPane.view.attach()), owner
 // раньше этого момента просто не существует.
+// attachMentionPopup довключает попап автодополнения "@..." уже после
+// того, как declarative-дерево создало и owner (главное окно), и само
+// поле ввода — раньше этого момента не на что вешать WS_POPUP с
+// owner'ом и не с чем сверять фокус чуть ниже.
 func (p *chatPane) attachMentionPopup(owner win.HWND) {
 	p.mentionPopup = newMentionPopup(owner)
+
+	// Закрываем попап, когда поле ввода теряет клавиатурный фокус —
+	// и по клику мимо (на сайдбар/чат внутри того же окна), и по
+	// Alt+Tab на другое приложение целиком: WM_KILLFOCUS в обоих
+	// случаях реально приходит контролу, который фокус теряет (см.
+	// MSDN, "Win32 Activation and Focus" — alt-tab туда включён явно),
+	// так что отдельно ловить WM_ACTIVATE владельца не нужно. Сам
+	// попап при этом фокус никогда не забирает (SWP_NOACTIVATE/
+	// SW_SHOWNOACTIVATE в show — см. popup_mention.go), так что клик
+	// по строке в самом попапе этот хендлер не потревожит.
+	p.input.FocusedChanged().Attach(func() {
+		if !p.input.Focused() {
+			p.closeMentionPopup()
+		}
+	})
 }
 
 // setWorkspace подключает chatPane к рабочей сессии сразу после
@@ -260,17 +299,27 @@ func (p *chatPane) showChannel(channelID string) {
 }
 
 // forget вычищает состояние канала, который только что удалили из
-// workspace (см. sidebar.onDeleteChannelClicked). watching чистить не
-// нужно: как только workspace.Remove закроет ChatService, канал
-// Messages() у watchMessages сам закроется, и она удалит себя из
-// watching (см. watchMessages) — но history может годами копиться в
-// памяти, если не почистить явно, а видимая область — просто
-// продолжит показывать текст уже несуществующего канала, если это
-// был именно тот, что сейчас открыт.
+// workspace (см. sidebar.onDeleteChannelClicked). history/badgeURLs/
+// chatters копились бы годами, если не почистить явно, а видимая
+// область — просто продолжила бы показывать текст уже
+// несуществующего канала, если это был именно тот, что сейчас открыт.
+//
+// watching тоже чистим здесь, а не ждём, пока сама watchMessages
+// дойдёт до своего Synchronize — иначе между закрытием канала и этим
+// моментом есть окно, в которое пользователь может успеть заново
+// открыть тот же логин: ensureWatching увидит в watching устаревшую
+// запись прежнего читателя и решит, что канал и так уже читается,
+// не запустив нового — новый ChatService так и останется непрочитанным.
+// Сама прежняя горутина не пострадает от того, что мы стёрли запись
+// раньше неё: у неё свой номер поколения (см. watching), и в конце она
+// удаляет свою запись только если та ещё совпадает с этим номером —
+// если к тому моменту там уже сидит номер нового читателя, она его не
+// тронет.
 func (p *chatPane) forget(channelID string) {
 	delete(p.history, channelID)
 	delete(p.badgeURLs, channelID)
 	delete(p.chatters, channelID)
+	delete(p.watching, channelID)
 
 	if p.displayedChannelID == channelID {
 		p.displayedChannelID = ""
@@ -286,7 +335,7 @@ func (p *chatPane) forget(channelID string) {
 func (p *chatPane) ensureWatching(channel domain.Channel) {
 	p.ensureBadgeCatalog(channel)
 
-	if p.watching[channel.ID] {
+	if p.watching[channel.ID] != 0 {
 		return
 	}
 	_, service, ok := p.workspace.Get(channel.ID)
@@ -294,8 +343,10 @@ func (p *chatPane) ensureWatching(channel domain.Channel) {
 		return
 	}
 
-	p.watching[channel.ID] = true
-	go p.watchMessages(channel.ID, service)
+	p.nextWatchGen++
+	gen := p.nextWatchGen
+	p.watching[channel.ID] = gen
+	go p.watchMessages(channel.ID, gen, service)
 }
 
 // ensureBadgeCatalog запускает загрузку каталога бейджей канала, если
@@ -368,7 +419,7 @@ func (p *chatPane) recomputeDisplayedChannel() {
 // продолжается, пока жив хотя бы один из двух (на практике оба
 // закрываются одновременно в Hub.dropChannel, но раздельная проверка
 // не помешает, если это когда-нибудь перестанет быть так).
-func (p *chatPane) watchMessages(channelID string, service *app.ChatService) {
+func (p *chatPane) watchMessages(channelID string, gen uint64, service *app.ChatService) {
 	messages := service.Messages()
 	deletions := service.Deletions()
 
@@ -390,11 +441,15 @@ func (p *chatPane) watchMessages(channelID string, service *app.ChatService) {
 	}
 
 	p.window.Synchronize(func() {
-		// Канал закрылся (отозван/не пересоздался) — освобождаем флаг:
-		// если пользователь позже откроет тот же логин заново, это
-		// будет уже другой ChatService с чистой подпиской, и для него
-		// нужен новый читатель, а не "уже же смотрим" из прошлого раза.
-		delete(p.watching, channelID)
+		// Освобождаем флаг только если он всё ещё "наш" — если канал
+		// успели закрыть и заново открыть, пока эта горутина дочитывала
+		// закрывающийся канал (см. forget), под этим же ключом уже
+		// может сидеть номер поколения НОВОГО читателя, и его трогать
+		// нельзя (иначе следующий ensureWatching для этого канала решит,
+		// что читателя нет вообще, и запустит третий, лишний).
+		if p.watching[channelID] == gen {
+			delete(p.watching, channelID)
+		}
 	})
 }
 
@@ -670,8 +725,10 @@ func (p *chatPane) onInputTextChanged() {
 		return
 	}
 
-	text := []rune(p.input.Text())
-	caret, _ := p.input.TextSelection()
+	textStr := p.input.Text()
+	text := []rune(textStr)
+	caretUTF16, _ := p.input.TextSelection()
+	caret := domain.RuneIndexFromUTF16(textStr, caretUTF16)
 
 	token, start, ok := domain.MentionTokenBefore(text, caret)
 	if !ok {
@@ -750,8 +807,10 @@ func (p *chatPane) matchChatters(channel domain.Channel, token string) []domain.
 // отображаемое имя — так оформляет упоминания сам Twitch, и это же
 // сравнивает isMentioned.
 func (p *chatPane) commitMention(user domain.User) {
-	text := []rune(p.input.Text())
-	caret, _ := p.input.TextSelection()
+	textStr := p.input.Text()
+	text := []rune(textStr)
+	caretUTF16, _ := p.input.TextSelection()
+	caret := domain.RuneIndexFromUTF16(textStr, caretUTF16)
 
 	if p.mentionStart < 0 || p.mentionStart > len(text) || caret > len(text) || caret < p.mentionStart {
 		p.closeMentionPopup()
@@ -764,11 +823,19 @@ func (p *chatPane) commitMention(user domain.User) {
 	newText = append(newText, text[:p.mentionStart]...)
 	newText = append(newText, replacement...)
 	newText = append(newText, text[caret:]...)
-	newCaret := p.mentionStart + len(replacement)
+	newCaretRune := p.mentionStart + len(replacement)
+
+	newTextStr := string(newText)
+	// SetTextSelection — сырой EM_SETSEL, ждёт позицию в UTF-16 code
+	// units, а newCaretRune посчитан в рунах (см. domain.RuneIndexFromUTF16
+	// выше — тот же случай, только в обратную сторону). Переводим уже по
+	// НОВОМУ тексту, а не по старому — позиции до и после подстановки в
+	// общем случае не совпадают.
+	newCaretUTF16 := domain.UTF16IndexFromRune(newTextStr, newCaretRune)
 
 	p.closeMentionPopup()
-	p.input.SetText(string(newText))
-	p.input.SetTextSelection(newCaret, newCaret)
+	p.input.SetText(newTextStr)
+	p.input.SetTextSelection(newCaretUTF16, newCaretUTF16)
 	p.input.SetFocus()
 }
 
@@ -830,8 +897,13 @@ func (p *chatPane) sendCurrentInput() {
 			}
 
 			p.input.SetText(text)
-			textLen := len([]rune(text))
-			p.input.SetTextSelection(textLen, textLen)
+			// SetTextSelection ждёт позицию в UTF-16 code units, а не в
+			// рунах (см. domain.RuneIndexFromUTF16 в onInputTextChanged/
+			// commitMention чуть выше) — тут это раньше пряталось за
+			// тем, что для BMP-символов разницы нет, но с эмодзи в тексте
+			// каретка встала бы не в конец, а куда-то раньше.
+			end := domain.UTF16IndexFromRune(text, len([]rune(text)))
+			p.input.SetTextSelection(end, end)
 
 			if originalReplyTo != nil {
 				p.startReply(*originalReplyTo)

@@ -134,7 +134,13 @@ func (p *mentionPopup) show(inputHwnd win.HWND, items []domain.User, onCommit fu
 	x := inputRect.Left
 	y := inputRect.Top - height
 
-	win.SetWindowPos(p.hwnd, win.HWND_TOPMOST, x, y, width, height, win.SWP_NOACTIVATE)
+	// HWND_TOP, не HWND_TOPMOST — попап должен быть НАД owner'ом (тем и
+	// хорош WS_POPUP + owner: сам прячется при сворачивании/деактивации
+	// владельца), а не НАД ВСЕМИ окнами системы разом. HWND_TOPMOST
+	// клал бы его в общесистемную topmost-полосу — тогда alt-tab на
+	// чужое приложение оставлял бы этот попап висеть поверх ЧУЖОГО
+	// окна, до следующего показа/скрытия.
+	win.SetWindowPos(p.hwnd, win.HWND_TOP, x, y, width, height, win.SWP_NOACTIVATE)
 	win.ShowWindow(p.hwnd, win.SW_SHOWNOACTIVATE)
 }
 
@@ -191,9 +197,7 @@ func (p *mentionPopup) commitSelected() {
 // WM_COMMAND/LBN_SELCHANGE). Всё остальное просто уходит в исходную
 // оконную процедуру без изменений.
 func (p *mentionPopup) wndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
-	const wmLButtonUp = 0x0202
-
-	if msg == wmLButtonUp {
+	if msg == win.WM_LBUTTONUP {
 		// lParam WM_LBUTTONUP уже упакован ровно так же, как ожидает
 		// LB_ITEMFROMPOINT (x в младшем слове, y в старшем, обе — координаты
 		// в клиентской области ЭТОГО ЖЕ окна) — можно передать как есть, без

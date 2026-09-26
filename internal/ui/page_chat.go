@@ -36,6 +36,9 @@ func buildChatPage(m *MainWindow) pageFactory {
 					Layout:  declarative.VBox{MarginsZero: true, SpacingZero: true},
 					Children: []declarative.Widget{
 						declarative.Composite{
+							// Небольшой отступ (пара пикселей) — без него
+							// кнопка утыкается прямо в край окна, выглядит
+							// некрасиво.
 							Layout: declarative.HBox{Margins: defaultMargins},
 							Children: []declarative.Widget{
 								declarative.PushButton{
@@ -66,6 +69,9 @@ func buildChatPage(m *MainWindow) pageFactory {
 							},
 						},
 						declarative.Composite{
+							// Тот же отступ, что и у "Добавить канал" сверху —
+							// просто симметрично, без специальной причины
+							// именно под таким же значением.
 							Layout: declarative.HBox{Margins: defaultMargins},
 							Children: []declarative.Widget{
 								declarative.PushButton{
@@ -85,7 +91,7 @@ func buildChatPage(m *MainWindow) pageFactory {
 					Layout: declarative.VBox{MarginsZero: true, SpacingZero: true},
 					Children: []declarative.Widget{
 						declarative.CustomWidget{
-							AssignTo: &m.chatPane.view.widget,
+							AssignTo: &m.chatPane.chatWidget,
 							Paint:    m.chatPane.view.paint,
 							// PaintBuffered — paint() рисует не прямо в
 							// экранный HDC, а в offscreen-битмап, и walk
@@ -121,6 +127,9 @@ func buildChatPage(m *MainWindow) pageFactory {
 							},
 						},
 						declarative.Composite{
+							// Небольшой отступ (пара пикселей) — без него
+							// кнопка "Отправить" утыкается прямо в край
+							// окна, выглядит некрасиво.
 							Layout: declarative.HBox{Margins: defaultMargins},
 							Children: []declarative.Widget{
 								declarative.LineEdit{
@@ -154,7 +163,7 @@ func buildChatPage(m *MainWindow) pageFactory {
 		// причине можно делать только теперь, а не в New(): раньше
 		// CustomWidget существовал сразу при создании окна, теперь —
 		// только с этого момента.
-		m.chatPane.view.attach()
+		m.chatPane.view.attach(m.chatPane.chatWidget)
 
 		// Попап автодополнения "@..." (см. mentionpopup.go) создаётся
 		// как отдельное WS_POPUP-окно с owner'ом — главным окном; раньше

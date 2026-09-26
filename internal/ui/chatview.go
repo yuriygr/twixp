@@ -71,21 +71,30 @@ type chatLine struct {
 	Deleted bool
 }
 
-var (
-	timestampColor   = walk.RGB(128, 128, 128)
-	defaultTextColor = walk.RGB(0, 0, 0)
+// Цвета ниже — на самом деле константы (не меняются после старта), но
+// walk.RGB — обычная функция, а не константное выражение, поэтому
+// пишем то же самое напрямую: walk.Color — это uint32, а R | G<<8 |
+// B<<16 — ровно формула из тела walk.RGB, просто без вызова в рантайме.
+// const, а не var — здесь осознанно: кисти вроде mentionBrush/
+// unreadBrush кэшируются один раз в attach() и не подхватят "смену
+// цвета на лету", если var когда-нибудь начнут мутировать — const
+// прямо запрещает эту ошибку на этапе компиляции, а не только словом
+// в комментарии.
+const (
+	timestampColor   walk.Color = 128 | 128<<8 | 128<<16
+	defaultTextColor walk.Color = 0 | 0<<8 | 0<<16
 	// mentionBgColor — едва красноватый фон строки с упоминанием
 	// текущего пользователя (см. chatLine.Mentioned). Специально бледный
 	// — это фон под ЧЁРНЫМ текстом (defaultTextColor выше), а не акцент
 	// поверх него, различимость текста важнее яркости подсветки.
-	mentionBgColor = walk.RGB(255, 232, 232)
+	mentionBgColor walk.Color = 255 | 232<<8 | 232<<16
 	// mentionBorderColor - чуть более заметный красный для полосы слева.
 	// Постарался подобрать сочетание цветов как в вебе.
-	mentionBorderColor = walk.RGB(255, 125, 125)
+	mentionBorderColor walk.Color = 255 | 125<<8 | 125<<16
 	// highlightBorderColor — цвет полосы слева у оплаченных баллами
 	// сообщений (см. chatLine.Highlighted). Тот же лиловый оттенок,
 	// каким Twitch выделяет "Highlight My Message" в вебе.
-	highlightBorderColor = walk.RGB(145, 71, 255)
+	highlightBorderColor walk.Color = 145 | 71<<8 | 255<<16
 	// systemMessageColor — цвет текста системных уведомлений (см.
 	// chatLine.SystemMessage). Тот же серый, что и у времени — то же
 	// самое "это не реплика собеседника" ощущение, что и у timestampColor,
@@ -96,8 +105,8 @@ var (
 	// уведомление, не пересекается по смыслу ни с упоминанием
 	// (красноватый mentionBgColor/mentionBorderColor), ни с выделением
 	// баллами (лиловый highlightBorderColor).
-	unreadIndicatorColor     = walk.RGB(60, 120, 220)
-	unreadIndicatorTextColor = walk.RGB(255, 255, 255)
+	unreadIndicatorColor     walk.Color = 60 | 120<<8 | 220<<16
+	unreadIndicatorTextColor walk.Color = 255 | 255<<8 | 255<<16
 )
 
 // chatPad* — внутренние отступы. chatLineGap — вертикальный зазор
@@ -161,6 +170,10 @@ const (
 // DefWindowProc, и оттуда явно перевызывается chatView.onMouseWheel,
 // если курсор сейчас над ним.
 type chatView struct {
+	// widget выставляется в attach(widget) — сам *walk.CustomWidget
+	// достаётся снаружи через AssignTo в chatPane.chatWidget (см.
+	// page_chat.go), сюда попадает уже параметром, а не через
+	// declarative-присвоение напрямую в это поле.
 	widget *walk.CustomWidget
 
 	// origWndProc — оконная процедура, которую вернул
@@ -305,12 +318,14 @@ func newChatView(onReply func(chatLine), resolveBadge func(domain.Badge) *walk.B
 }
 
 // attach довключает поведение chatView уже после того, как
-// declarative-дерево в build() создало и присвоило v.widget через
-// AssignTo (тот же порядок, что у sidebar.window/chatPane.window) —
-// раньше построения самого окна вешать обработчики и контекстное меню
-// не на что.
-func (v *chatView) attach() {
-	widget := v.widget
+// declarative-дерево в build() создало сам CustomWidget — раньше
+// построения самого окна вешать обработчики и контекстное меню не на
+// что. widget приходит параметром, а не читается из v.widget — сам
+// *walk.CustomWidget достаётся через AssignTo в chatPane.chatWidget
+// (см. page_chat.go), chatView своё поле widget выставляет себе сам,
+// а не получает его торчащим наружу полем-в-поле у вызывающей стороны.
+func (v *chatView) attach(widget *walk.CustomWidget) {
+	v.widget = widget
 
 	if bg, err := walk.NewSystemColorBrush(walk.SysColorWindow); err == nil {
 		widget.SetBackground(bg)
@@ -665,6 +680,9 @@ func (v *chatView) updateNickFont(base *walk.Font) {
 // случае только запоминает значение в fontSize, а сама подгонка шрифта
 // происходит позже, в attach() (см. applyFontSize).
 func (v *chatView) setFontSize(pt int) {
+	if v.fontSize == pt {
+		return
+	}
 	v.fontSize = pt
 	if v.widget == nil {
 		return
@@ -961,7 +979,7 @@ func (v *chatView) layoutLine(canvas *walk.Canvas, font *walk.Font, line chatLin
 	wide := walk.Rectangle{Width: 10000, Height: 10000}
 	const singleLineMeasure = walk.TextSingleLine | walk.TextCalcRect
 
-	tsText := line.Time.Local().Format("15:04:05")
+	tsText := formatTimestamp(line.Time)
 	var ts walk.Rectangle
 	if v.showTimestamps {
 		tsM, _, err := canvas.MeasureText(tsText, font, wide, singleLineMeasure)
@@ -1069,6 +1087,27 @@ func bannerTextFor(line chatLine) (text string, ok bool) {
 	return "", false
 }
 
+// formatTimestamp — общий формат времени сообщения. Используется и в
+// layoutLine/layoutSystemMessage (чтобы измерить ширину), и в drawLine
+// (чтобы нарисовать) — раньше литерал "15:04:05" был независимо
+// продублирован в четырёх местах: поменяли бы формат в одном — и
+// разъехались бы раскладка с отрисовкой.
+func formatTimestamp(t time.Time) string {
+	return t.Local().Format("15:04:05")
+}
+
+// effectiveSystemFont — v.systemFont, если он есть, иначе base.
+// systemFont может быть nil, если NewFont в updateSystemFont
+// почему-то не удался (см. её комментарий) — тогда просто рисуем
+// обычным шрифтом, без курсива, а не роняем раскладку/отрисовку
+// целиком. Общее место для layoutSystemMessage и drawLine.
+func (v *chatView) effectiveSystemFont(base *walk.Font) *walk.Font {
+	if v.systemFont != nil {
+		return v.systemFont
+	}
+	return base
+}
+
 // layoutSystemMessage — упрощённая раскладка для системных уведомлений
 // (см. chatLine.SystemMessage): только время (если оно включено в
 // настройках) и сам текст курсивом, без бейджей/ника/баннера сверху —
@@ -1082,7 +1121,7 @@ func (v *chatView) layoutSystemMessage(canvas *walk.Canvas, font *walk.Font, lin
 
 	var ts walk.Rectangle
 	if v.showTimestamps {
-		tsText := line.Time.Local().Format("15:04:05")
+		tsText := formatTimestamp(line.Time)
 		tsM, _, err := canvas.MeasureText(tsText, font, wide, singleLineMeasure)
 		if err != nil {
 			return lineLayout{}, err
@@ -1092,12 +1131,8 @@ func (v *chatView) layoutSystemMessage(canvas *walk.Canvas, font *walk.Font, lin
 	}
 
 	// systemFont может быть nil, если NewFont в updateSystemFont
-	// почему-то не удался (см. её комментарий) — тогда просто рисуем
-	// обычным шрифтом, без курсива, а не роняем раскладку целиком.
-	systemFont := font
-	if v.systemFont != nil {
-		systemFont = v.systemFont
-	}
+	// почему-то не удался — см. effectiveSystemFont.
+	systemFont := v.effectiveSystemFont(font)
 
 	textWidth := width - x - chatPadX
 	if textWidth < 40 {
@@ -1258,16 +1293,13 @@ func (v *chatView) drawLine(canvas *walk.Canvas, font *walk.Font, line chatLine,
 
 	if line.SystemMessage != "" {
 		if v.showTimestamps {
-			tsText := line.Time.Local().Format("15:04:05")
+			tsText := formatTimestamp(line.Time)
 			if err := canvas.DrawText(tsText, font, timestampColor, at(layout.ts), walk.TextSingleLine); err != nil {
 				return err
 			}
 		}
 
-		systemFont := font
-		if v.systemFont != nil {
-			systemFont = v.systemFont
-		}
+		systemFont := v.effectiveSystemFont(font)
 		if err := canvas.DrawText(line.SystemMessage, systemFont, systemMessageColor, at(layout.text), walk.TextWordbreak); err != nil {
 			return err
 		}
@@ -1303,7 +1335,7 @@ func (v *chatView) drawLine(canvas *walk.Canvas, font *walk.Font, line chatLine,
 	}
 
 	if v.showTimestamps {
-		tsText := line.Time.Local().Format("15:04:05")
+		tsText := formatTimestamp(line.Time)
 		if err := canvas.DrawText(tsText, font, timestampColor, at(layout.ts), walk.TextSingleLine); err != nil {
 			return err
 		}

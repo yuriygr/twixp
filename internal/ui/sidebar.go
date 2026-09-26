@@ -398,8 +398,28 @@ func (m *channelListModel) setShowAvatars(show bool) {
 	m.PublishRowsReset()
 }
 
+// setChannels заменяет список каналов целиком (см. sidebar.reload) —
+// зовётся при каждом добавлении/удалении канала, а не только на входе.
+//
+// avatars чистим здесь же: ключ там — channelID, а сам кэш раньше не
+// подчищался НИКОГДА, ни при удалении канала, ни тут — на каждое
+// открыть-закрыть-открыть-другой копился ещё один *walk.Bitmap
+// (HBITMAP, GDI-объект с жёстким лимитом на процесс). Дешевле всего
+// чистить сразу тут, а не заводить отдельный forget-путь только под
+// это: набор каналов и так пересобирается целиком на каждое изменение.
 func (m *channelListModel) setChannels(channels []domain.Channel) {
 	m.channels = channels
+
+	live := make(map[string]bool, len(channels))
+	for _, ch := range channels {
+		live[ch.ID] = true
+	}
+	for id := range m.avatars {
+		if !live[id] {
+			delete(m.avatars, id)
+		}
+	}
+
 	m.PublishRowsReset()
 }
 

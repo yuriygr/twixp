@@ -230,7 +230,7 @@ func (m *MainWindow) Run() {
 }
 
 func (m *MainWindow) build() error {
-	icon, _ := walk.NewIconFromResourceId(2)
+	icon := appIcon()
 
 	var pageContainer *walk.Composite
 
@@ -451,8 +451,8 @@ func (m *MainWindow) onMainWindowSizeChanged() {
 // скроллящийся колесом виджет во всём приложении, второго такого места
 // пока нет и заводить общий "роутер" под это преждевременно.
 func (m *MainWindow) onMouseWheel(x, y int, button walk.MouseButton) {
-	view := m.chatPane.view
-	if view.widget == nil {
+	widget := m.chatPane.chatWidget
+	if widget == nil {
 		return // страница чата ещё не построена — сворачивать нечего
 	}
 
@@ -463,14 +463,14 @@ func (m *MainWindow) onMouseWheel(x, y int, button walk.MouseButton) {
 	// MSDN. Поэтому сравниваем прямо с GetWindowRect, без
 	// ScreenToClient.
 	var rect win.RECT
-	if !win.GetWindowRect(view.widget.Handle(), &rect) {
+	if !win.GetWindowRect(widget.Handle(), &rect) {
 		return
 	}
 	if x < int(rect.Left) || x >= int(rect.Right) || y < int(rect.Top) || y >= int(rect.Bottom) {
 		return // курсор не над chatView — это не наше колесо
 	}
 
-	view.onMouseWheel(x, y, button)
+	m.chatPane.view.onMouseWheel(x, y, button)
 }
 
 // redrawClientEdges — тот же самый вызов SetWindowPos с
@@ -494,8 +494,8 @@ func (m *MainWindow) redrawClientEdges() {
 	if m.sidebar.view != nil {
 		win.SetWindowPos(m.sidebar.view.Handle(), 0, 0, 0, 0, 0, swpFrameOnly)
 	}
-	if m.chatPane.view.widget != nil {
-		win.SetWindowPos(m.chatPane.view.widget.Handle(), 0, 0, 0, 0, 0, swpFrameOnly)
+	if m.chatPane.chatWidget != nil {
+		win.SetWindowPos(m.chatPane.chatWidget.Handle(), 0, 0, 0, 0, 0, swpFrameOnly)
 	}
 }
 

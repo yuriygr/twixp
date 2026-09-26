@@ -51,7 +51,7 @@ func showSettingsDialog(owner walk.Form, current domain.Settings, save SettingsS
 	var showAvatars, mentionAutocomplete, alwaysOnTop *walk.CheckBox
 	var fontSize *walk.NumberEdit
 
-	icon, _ := walk.NewIconFromResourceId(2)
+	icon := appIcon()
 
 	err := (declarative.Dialog{
 		AssignTo:      &dlg,
@@ -127,17 +127,41 @@ func showSettingsDialog(owner walk.Form, current domain.Settings, save SettingsS
 						Decimals:  0,
 						Increment: 1,
 						Value:     float64(settings.FontSize),
+						// Только запоминаем значение — commit() (а
+						// значит и дорогой setFontSize →
+						// recomputeLayout, 500 MeasureText на большой
+						// истории) не зовём на каждое изменение: у
+						// NumberEdit в этой версии walk ValueChanged
+						// стреляет на КАЖДУЮ цифру набора (печатаете "1",
+						// потом "12" — событие два раза, с разными
+						// значениями), а не после того, как пользователь
+						// закончил. commit() зовём один раз чуть ниже,
+						// когда поле теряет фокус (см. FocusedChanged
+						// после Create) — и ещё раз, страховкой, прямо
+						// перед закрытием диалога (см. closeBtn).
 						OnValueChanged: func() {
 							settings.FontSize = int(fontSize.Value())
-							commit()
 						},
 					},
 				},
 			},
 			declarative.PushButton{
-				AssignTo:  &closeBtn,
-				Text:      "Закрыть",
-				OnClicked: func() { dlg.Accept() },
+				AssignTo: &closeBtn,
+				Text:     "Закрыть",
+				OnClicked: func() {
+					// commit(), а не просто dlg.Accept(): если
+					// пользователь дошёл до Enter прямо из NumberEdit,
+					// не переводя фокус (IsDialogMessage может отдать
+					// Enter дефолтной кнопке напрямую, без промежуточного
+					// WM_KILLFOCUS на поле) — FocusedChanged ниже не
+					// успеет сработать, и последнее набранное значение
+					// применится/сохранится только тут. Повторный вызов
+					// commit() с уже применённым значением ничего не
+					// стоит — все сеттеры внутри apply идемпотентны (см.
+					// комментарий выше).
+					commit()
+					dlg.Accept()
+				},
 			},
 		},
 	}).Create(owner)
@@ -145,6 +169,16 @@ func showSettingsDialog(owner walk.Form, current domain.Settings, save SettingsS
 		log.Println("открыть диалог настроек:", err)
 		return
 	}
+
+	// FocusedChanged — не декларативное поле NumberEdit, вешаем уже
+	// после Create. commit() здесь — тот самый момент "пользователь
+	// закончил печатать", которого NumberEdit в этой версии walk не
+	// даёт напрямую (нет OnEditingFinished).
+	fontSize.FocusedChanged().Attach(func() {
+		if !fontSize.Focused() {
+			commit()
+		}
+	})
 
 	dlg.Run()
 }

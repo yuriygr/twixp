@@ -45,7 +45,7 @@ func showAddChannelDialog(owner walk.Form) (string, bool) {
 		dlg.Accept()
 	}
 
-	icon, _ := walk.NewIconFromResourceId(2)
+	icon := appIcon()
 
 	err := (declarative.Dialog{
 		AssignTo:      &dlg,

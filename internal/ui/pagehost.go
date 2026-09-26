@@ -61,25 +61,43 @@ func newPageHost(container *walk.Composite) *pageHost {
 // результат входа) — и если build всё же вернёт ошибку (совсем не
 // win32, а, скажем, баг в дереве виджетов), пользователь останется с
 // рабочей текущей страницей, а не с пустым контейнером.
+//
+// "Уничтожается только при успехе" относится не только к build, но и к
+// последующему layout.Update: старая страница прячется и отцепляется
+// от layout, но Dispose() у неё вызывается только ПОСЛЕ того, как
+// Update отработал без ошибки. Если Update всё же упадёт (в контракте
+// он может, хоть это и маловероятно) — старая страница ещё жива и
+// просто возвращается на место, а не потеряна вместе с новой,
+// недоразложенной.
 func (h *pageHost) show(build pageFactory) error {
 	page, err := build(h.container)
 	if err != nil {
 		return err
 	}
 
-	if h.current != nil {
-		old := h.current
+	old := h.current
+	if old != nil {
 		old.SetVisible(false)
 		old.SetParent(nil)
-		old.Dispose()
 	}
-
 	h.current = page
 
 	if layout := h.container.Layout(); layout != nil {
 		if err := layout.Update(false); err != nil {
+			if old != nil {
+				old.SetParent(h.container)
+				old.SetVisible(true)
+				h.current = old
+			}
+			page.SetVisible(false)
+			page.SetParent(nil)
+			page.Dispose()
 			return err
 		}
+	}
+
+	if old != nil {
+		old.Dispose()
 	}
 
 	return nil
