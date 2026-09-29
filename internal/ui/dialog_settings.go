@@ -180,5 +180,19 @@ func showSettingsDialog(owner walk.Form, current domain.Settings, save SettingsS
 		}
 	})
 
+	// Крестик в заголовке окна — отдельный путь закрытия, идущий в
+	// обход closeBtn.OnClicked целиком: WM_CLOSE у walk.Dialog
+	// публикует именно Closing(), кнопку это не касается (см. vendor
+	// lxn/walk, form.go — case win.WM_CLOSE: fb.closingPublisher.
+	// Publish(...), про OnClicked там ни слова). Без этой подписки
+	// набранный, но не потерявший фокус FontSize терялся бы при
+	// закрытии крестиком — единственном пути, который не проходит ни
+	// через commit() у closeBtn, ни через FocusedChanged выше.
+	// Повторный commit() тут не вредит — все сеттеры внутри apply
+	// идемпотентны (см. её комментарий).
+	dlg.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
+		commit()
+	})
+
 	dlg.Run()
 }

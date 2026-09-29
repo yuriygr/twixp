@@ -27,7 +27,7 @@ import (
 func showAddChannelDialog(owner walk.Form) (string, bool) {
 	var dlg *walk.Dialog
 	var loginEdit *walk.LineEdit
-	var addBtn, cancelBtn *walk.PushButton
+	var addBtn, cancelBtn *walk.PushButton // cancelBtn нужен только как AssignTo для CancelButton ниже — маршрутизирует Esc на его Clicked тем же win32-механизмом, что и DefaultButton для Enter; свой OnClicked ему не нужен, диалог с Esc закрывается сам через walk.Dialog
 
 	login := ""
 	ok := false

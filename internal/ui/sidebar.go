@@ -93,9 +93,32 @@ func (s *sidebar) setWorkspace(ws *app.ChatWorkspace, resolve ChannelResolver) {
 
 // reload перечитывает список открытых чатов из workspace и
 // перестраивает и модель, и channelOrder. Вызывать после любого
-// изменения состава каналов (добавление, закрытие извне).
+// изменения состава каналов (добавление, закрытие — не важно, по
+// инициативе пользователя через контекстное меню или извне, см.
+// MainWindow.NotifyChannelClosed).
+//
+// Сам вычисляет, какие каналы из предыдущего s.channelOrder пропали, и
+// зовёт onChannelRemoved для каждого — единственное место, которое это
+// делает. Раньше это было обязанностью каждого вызывающего кода
+// отдельно (onDeleteChannelClicked звал onChannelRemoved явно, ДО
+// reload) — и путь закрытия канала извне (NotifyChannelClosed) про
+// это просто не знал, так что chatPane.forget для него никогда не
+// вызывался: история/бейджи/chatters оставались в памяти, хотя канал
+// пользователю показывался как закрытый. Теперь оба пути ведут себя
+// одинаково, потому что это одна и та же функция, а не два похожих
+// куска кода в разных местах.
 func (s *sidebar) reload() {
 	channels := s.workspace.List()
+
+	live := make(map[string]bool, len(channels))
+	for _, ch := range channels {
+		live[ch.ID] = true
+	}
+	for _, ch := range s.channelOrder {
+		if !live[ch.ID] {
+			s.onChannelRemoved(ch.ID)
+		}
+	}
 
 	s.channelOrder = channels
 	s.model.setChannels(channels)
@@ -237,7 +260,13 @@ func (s *sidebar) onDeleteChannelClicked() {
 		s.status.logAndShowError(fmt.Errorf("удалить чат %s: %v", channel.Name, err))
 	}
 
-	s.onChannelRemoved(channel.ID)
+	// onChannelRemoved для этого канала вызовет сам reload() — он
+	// сравнивает workspace.List() с тем, что было в channelOrder до
+	// этого вызова, и сам находит разницу (см. reload). Раньше тут был
+	// ещё и явный s.onChannelRemoved(channel.ID) — избыточный (и, если
+	// Remove выше вернул ошибку и канал на самом деле остался открытым,
+	// неверный: chatPane забыл бы историю канала, который на самом деле
+	// никуда не делся).
 	s.reload()
 
 	// Если что-то ещё осталось открытым — делаем активным первый канал
@@ -302,10 +331,6 @@ func (s *sidebar) currentChannel() (domain.Channel, bool) {
 	return s.channelOrder[idx], true
 }
 
-// onAddChannelClicked обрабатывает "+" — открывает канал по логину из
-// loginInput. Резолв логина и Add — блокирующий сетевой I/O, поэтому
-// уходит в отдельную горутину: дёргать его прямо в обработчике клика
-// значило бы заморозить окно на время сетевого запроса.
 // onAddChannelClicked открывает модальный диалог добавления канала
 // (см. addchanneldialog.go) и, если пользователь ввёл логин и нажал
 // "Добавить", резолвит его и открывает. Резолв логина и Add —
@@ -322,10 +347,34 @@ func (s *sidebar) onAddChannelClicked() {
 	go s.addChannel(login)
 }
 
+// addChannel — тело onAddChannelClicked, в отдельной горутине (см. её
+// комментарий).
+//
+// s.resolve/s.workspace выставляются вместе в setWorkspace, а кнопка
+// "Добавить канал" физически существует только на странице чата,
+// которая строится уже после успешного входа (см. applySignIn) — то
+// есть сейчас нажать её раньше, чем оба поля выставлены, невозможно.
+// Проверка ниже — не на случай, что это когда-нибудь станет неверным
+// незаметно: без неё nil-поле-функция обернулось бы совсем не
+// показательной паникой где-то в глубине горутины, а не понятной
+// ошибкой в статус-баре.
 func (s *sidebar) addChannel(login string) {
-	channel, err := s.resolve(login)
-	if err == nil {
-		_, err = s.workspace.Add(channel)
+	var channel domain.Channel
+	var err error
+
+	if s.resolve == nil || s.workspace == nil {
+		err = fmt.Errorf("канал %s: sidebar ещё не подключён к рабочей сессии", login)
+	} else {
+		channel, err = s.resolve(login)
+		if err == nil {
+			_, err = s.workspace.Add(channel)
+		}
+	}
+
+	if s.window == nil {
+		// Дальше сообщить об ошибке уже некому и нечем — Synchronize
+		// без window означало бы панику вместо тихого выхода.
+		return
 	}
 
 	s.window.Synchronize(func() {

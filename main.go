@@ -123,9 +123,21 @@ func main() {
 			mw.SetConnectionStatus(false)
 		}
 
-		workspace = app.NewChatWorkspace(hub.NewReader, helixClient, appStore.AsChannelStore())
+		channelStore := appStore.AsChannelStore()
+		workspace = app.NewChatWorkspace(hub.NewReader, helixClient, func(channels []domain.Channel) {
+			// Персистентность — забота вызывающей стороны (main.go), а
+			// не ChatWorkspace: он только сообщает "список изменился".
+			// Ошибку сознательно не поднимаем выше — так же, как раньше
+			// молчал сам ChatWorkspace: потеря сохранённого списка не
+			// должна ронять операцию над чатом, которая его вызвала
+			// (Add/Remove уже применились к in-memory состоянию к этому
+			// моменту).
+			if err := channelStore.Save(channels); err != nil {
+				log.Println("сохранить список чатов:", err)
+			}
+		})
 
-		if saved, err := appStore.AsChannelStore().Load(); err != nil {
+		if saved, err := channelStore.Load(); err != nil {
 			log.Println("восстановить сохранённые чаты:", err)
 		} else {
 			for _, ch := range saved {

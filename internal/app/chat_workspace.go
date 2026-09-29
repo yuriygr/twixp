@@ -14,7 +14,19 @@ import (
 type ChatWorkspace struct {
 	newReader func() ChatReader
 	sender    ChatSender
-	store     ChannelStore
+	onChanged func([]domain.Channel)
+
+	// addMu сериализует Add сам с собой — единственная операция,
+	// которая делает блокирующий сетевой I/O (см. Add) вне w.mu.
+	// Без этого при гипотетическом параллельном Add на один и тот же
+	// канал оба вызова успевали бы законнектиться, и один из
+	// результатов закрывался бы — то есть дважды тратился бы
+	// rate-limit Twitch (Subscribe + DeleteSubscription) на один и тот
+	// же канал впустую. addMu не даёт этой ситуации возникнуть вообще:
+	// пока один Add коннектится, второй ждёт своей очереди именно у
+	// addMu, а не у w.mu — Active/List/Get/SetActive/Remove им не
+	// блокируются, только другие Add.
+	addMu sync.Mutex
 
 	mu       sync.Mutex
 	sessions map[string]*chatSession
@@ -30,22 +42,32 @@ type chatSession struct {
 // NewChatWorkspace создаёт пустой workspace.
 //
 // newReader вызывается один раз на каждый добавляемый канал — чтобы
-// создать для него свежий ChatReader. Это фабрика, а не готовый
-// экземпляр, потому что у каждого канала своя подписка (деталь того,
-// как именно устроено соединение — общий ли сокет на всех или нет —
-// целиком остаётся внутри конкретной реализации ChatReader).
+// создать для него свежий ChatReader. Конкретная реализация вправе
+// сама решать, сколько за этим реально стоит физических соединений:
+// например, eventsub.Hub.NewReader возвращает лёгкий per-channel
+// объект поверх одного общего WebSocket-хаба, а не открывает новый
+// сокет на каждый вызов — с точки зрения этого интерфейса неважно, как
+// это устроено внутри, важно только чтобы Connect/Messages/Deletions/
+// Close вели себя ровно так, как описано в ChatReader.
 //
 // sender — один общий на все каналы: Helix Send Chat Message не
 // привязан к соединению конкретного канала.
 //
-// store — опциональное хранение списка открытых каналов между
-// запусками. Может быть nil, если персистентность не нужна (например,
-// в коротких тестовых прогонах).
-func NewChatWorkspace(newReader func() ChatReader, sender ChatSender, store ChannelStore) *ChatWorkspace {
+// onChanged вызывается после каждого изменения списка каналов —
+// добавления или удаления (но НЕ после Close, см. его комментарий) —
+// со снапшотом полного списка в порядке добавления. Обычно это и есть
+// персистентность (см. main.go: onChanged оборачивает
+// ChannelStore.Save), но ChatWorkspace сам не знает, что это —
+// он просто сообщает "список изменился, вот новый". Может быть nil,
+// если это не нужно (например, в коротких тестовых прогонах).
+// ChatWorkspace также не умеет ЧИТАТЬ сохранённый список при старте —
+// это остаётся на вызывающей стороне: обычный ChannelStore.Load с
+// последующими Add на каждый канал.
+func NewChatWorkspace(newReader func() ChatReader, sender ChatSender, onChanged func([]domain.Channel)) *ChatWorkspace {
 	return &ChatWorkspace{
 		newReader: newReader,
 		sender:    sender,
-		store:     store,
+		onChanged: onChanged,
 		sessions:  make(map[string]*chatSession),
 	}
 }
@@ -54,6 +76,16 @@ func NewChatWorkspace(newReader func() ChatReader, sender ChatSender, store Chan
 // уже открыт, повторное соединение не создаётся — возвращается
 // существующая сессия.
 func (w *ChatWorkspace) Add(channel domain.Channel) (*ChatService, error) {
+	if channel.ID == "" {
+		return nil, fmt.Errorf("empty channel ID")
+	}
+
+	// addMu держим на весь метод, включая блокирующий Connect ниже —
+	// см. комментарий у поля. w.mu (быстрый, только для state) при
+	// этом занимаем отдельно и ненадолго, а не на всё время I/O.
+	w.addMu.Lock()
+	defer w.addMu.Unlock()
+
 	w.mu.Lock()
 	if existing, ok := w.sessions[channel.ID]; ok {
 		w.mu.Unlock()
@@ -63,13 +95,14 @@ func (w *ChatWorkspace) Add(channel domain.Channel) (*ChatService, error) {
 
 	// service.Connect — блокирующий сетевой I/O (dial+handshake
 	// eventsub-хаба, если это первый открытый канал, плюс HTTP-вызов
-	// подписки), может занять секунды. Намеренно вне лока: иначе на
-	// это время замирают все остальные операции над workspace —
+	// подписки), может занять секунды. Вне w.mu намеренно: иначе на это
+	// время замирают все остальные операции над workspace —
 	// Active/List/SetActive/Remove, в том числе фоновая чистка из
-	// eventsub.Hub при отзыве подписки или провале ресабскрайба
-	// (main.go's forgetChannel), которая крутится в отдельной
-	// горутине и не должна ждать, пока пользователь дозвонится до
-	// нового канала.
+	// eventsub.Hub при отзыве подписки или провале ресабскрайба,
+	// которая крутится в отдельной горутине и не должна ждать, пока
+	// пользователь дозвонится до нового канала. addMu выше при этом
+	// всё равно не даёт второму Add начать точно то же самое параллельно
+	// — см. комментарий у поля.
 	reader := w.newReader()
 	service := NewChatService(reader, w.sender)
 
@@ -78,28 +111,15 @@ func (w *ChatWorkspace) Add(channel domain.Channel) (*ChatService, error) {
 	}
 
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	// Пока коннектились без лока, кто-то мог успеть добавить тот же
-	// канал (сейчас Add вызывается только с основной горутины
-	// последовательно, так что этой гонки не бывает на практике — но
-	// метод экспортируемый, и это не тот инвариант, на который стоит
-	// молча полагаться). Если так — отдаём чужой результат, а
-	// свежесозданное соединение закрываем, чтобы не плодить лишние
-	// подписки на одном канале.
-	if existing, ok := w.sessions[channel.ID]; ok {
-		_ = service.Close()
-		return existing.service, nil
-	}
-
 	w.sessions[channel.ID] = &chatSession{channel: channel, service: service}
 	w.order = append(w.order, channel.ID)
-
 	if w.active == "" {
 		w.active = channel.ID
 	}
+	snapshot := w.snapshotChannelsLocked()
+	w.mu.Unlock()
 
-	w.persistLocked()
+	w.notifyChanged(snapshot)
 
 	return service, nil
 }
@@ -127,14 +147,16 @@ func (w *ChatWorkspace) Remove(channelID string) error {
 	}
 
 	delete(w.sessions, channelID)
-	w.order = removeString(w.order, channelID)
+	w.order = removeStringInPlace(w.order, channelID)
 
 	if w.active == channelID {
 		w.active = ""
 	}
 
-	w.persistLocked()
+	snapshot := w.snapshotChannelsLocked()
 	w.mu.Unlock()
+
+	w.notifyChanged(snapshot)
 
 	if err := session.service.Close(); err != nil {
 		return fmt.Errorf("close channel %s: %v", channelID, err)
@@ -192,15 +214,19 @@ func (w *ChatWorkspace) List() []domain.Channel {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	channels := make([]domain.Channel, 0, len(w.order))
-	for _, id := range w.order {
-		channels = append(channels, w.sessions[id].channel)
-	}
-	return channels
+	return w.snapshotChannelsLocked()
 }
 
 // Close закрывает все открытые чаты. Предназначен для завершения
 // работы приложения.
+//
+// Персистентный список НЕ трогает и НЕ обнуляет (onChanged не
+// зовётся) — это осознанно: Close вызывается при выходе из
+// приложения, а не как "забыть все каналы", и пользователь ожидает
+// увидеть тот же список при следующем запуске, а не пустой сайдбар.
+// Если когда-нибудь понадобится ещё и явный сброс — это должен быть
+// отдельный, отдельно названный метод, а не другое поведение того же
+// Close в зависимости от контекста вызова.
 func (w *ChatWorkspace) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -219,7 +245,13 @@ func (w *ChatWorkspace) Close() error {
 	return firstErr
 }
 
-func removeString(items []string, target string) []string {
+// removeStringInPlace убирает первое совпадение target из items,
+// мутируя исходный слайс (классический in-place filter из Go idioms —
+// НЕ чистая функция, несмотря на то, что возвращает результат: старый
+// backing array переиспользуется). Безопасно ровно потому, что
+// единственный вызывающий (Remove) — единственный владелец w.order и
+// не хранит других ссылок на тот же слайс где-то ещё.
+func removeStringInPlace(items []string, target string) []string {
 	out := items[:0]
 	for _, item := range items {
 		if item != target {
@@ -229,19 +261,32 @@ func removeString(items []string, target string) []string {
 	return out
 }
 
-// persistLocked сохраняет текущий список открытых каналов через
-// ChannelStore, если он задан. ВАЖНО: должен вызываться только пока
-// w.mu уже захвачен вызывающим кодом — сам лок не берёт. Ошибка
-// сохранения игнорируется намеренно: потеря сохранённого списка не
-// должна ронять саму операцию над чатом.
-func (w *ChatWorkspace) persistLocked() {
-	if w.store == nil {
-		return
-	}
-
+// snapshotChannelsLocked — список каналов в порядке добавления, для
+// List() и для onChanged после каждого изменения. Вызывать только под
+// w.mu.
+//
+// ok-проверка при обращении к w.sessions[id] — не паранойя: order и
+// sessions поддерживаются в паре везде в этом файле, но явная проверка
+// тут дешевле, чем паника где-то в глубине рендеринга сайдбара, если
+// они когда-нибудь разъедутся из-за будущего бага в Add/Remove.
+func (w *ChatWorkspace) snapshotChannelsLocked() []domain.Channel {
 	channels := make([]domain.Channel, 0, len(w.order))
 	for _, id := range w.order {
-		channels = append(channels, w.sessions[id].channel)
+		if s, ok := w.sessions[id]; ok {
+			channels = append(channels, s.channel)
+		}
 	}
-	_ = w.store.Save(channels)
+	return channels
+}
+
+// notifyChanged сообщает о новом списке каналов через onChanged, если
+// он задан. Вызывать БЕЗ w.mu — наружу должен уходить уже готовый
+// снапшот, а не сам workspace, и вызывающая сторона (обычно —
+// сохранение на диск) не должна иметь возможность случайно дёрнуть
+// что-то из ChatWorkspace изнутри колбэка и словить deadlock на том же
+// w.mu.
+func (w *ChatWorkspace) notifyChanged(channels []domain.Channel) {
+	if w.onChanged != nil {
+		w.onChanged(channels)
+	}
 }

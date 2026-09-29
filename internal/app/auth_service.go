@@ -1,8 +1,10 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"twixp/internal/domain"
@@ -13,6 +15,10 @@ import (
 // определению TryReuse не идёт дальше в интерактивный AuthFlow.
 // Сигнал вызывающему коду: показывать пользователю способ войти самому
 // (кнопку, ссылку — что уместно в конкретном UI).
+//
+// Тот же самый сигнал отдаёт и EnsureAuthenticated(nil) — вызов с nil
+// onPrompt семантически и есть "тихая попытка, без интерактива", то
+// есть TryReuse под другим именем (см. EnsureAuthenticated).
 var ErrNoReusableToken = errors.New("нет токена, который можно тихо переиспользовать")
 
 // AuthService гарантирует, что у приложения есть рабочий OAuth-токен:
@@ -46,12 +52,37 @@ type AuthService struct {
 	// обновил параллельный вызов), инвалидация не должна задеть уже
 	// свежий токен — она просто ни с чем не совпадёт.
 	invalidAccessToken string
+
+	// cancelMu/cancelAuthorize — отдельный, короткий лок специально
+	// под отмену текущего интерактивного AuthFlow (см. Logout). НЕ тот
+	// же mu, что сериализует load→refresh→authorize→save: пока
+	// EnsureAuthenticated стоит внутри Authorize, она держит mu на всё
+	// это время (по замыслу — не более одной интерактивной попытки
+	// сразу), и если бы Logout тоже приходилось ждать mu, отменить
+	// зависшую попытку было бы нечем — тем же самым mu Logout и
+	// заблокирован. cancelMu берётся на доли секунды (сохранить один
+	// указатель на функцию) и никогда не удерживается на время
+	// сетевого I/O, поэтому не мешает основной сериализации.
+	cancelMu        sync.Mutex
+	cancelAuthorize context.CancelFunc
 }
 
 // NewAuthService связывает AuthService с конкретной парой store/flow
 // и опциональным refresher'ом (может быть nil — тогда обновление
 // токена всегда идёт через полный AuthFlow).
+//
+// store и flow обязательны — паникуем сразу, а не откладываем до
+// первого вызова: без них AuthService не может сделать буквально
+// ничего полезного, и был бы разве что вводящим в заблуждение nil-panic
+// где-то в глубине EnsureAuthenticated вместо понятного сообщения
+// прямо в точке создания.
 func NewAuthService(store TokenStore, flow AuthFlow, refresher TokenRefresher) *AuthService {
+	if store == nil {
+		panic("app.NewAuthService: store is nil")
+	}
+	if flow == nil {
+		panic("app.NewAuthService: flow is nil")
+	}
 	return &AuthService{store: store, flow: flow, refresher: refresher}
 }
 
@@ -66,6 +97,17 @@ func NewAuthService(store TokenStore, flow AuthFlow, refresher TokenRefresher) *
 // трактуется одинаково — как повод пройти шаги (2)/(3). Если
 // понадобится различать "токена нет" от "хранилище сломано" — можно
 // уточнить позже, не меняя сигнатуру метода.
+//
+// onPrompt == nil означает "интерактив невозможен, показывать код
+// некому" (см. AuthFlow.Authorize) — в этом случае шаг (3) не
+// запускается вовсе: EnsureAuthenticated(nil) эквивалентен TryReuse()
+// и возвращает ErrNoReusableToken, если шаги (1)/(2) не сработали, а
+// не проваливается в интерактивный AuthFlow с некому-звонить onPrompt,
+// который иначе завис бы там до таймаута device code — и на всё это
+// время держал бы mu, блокируя TryReuse/MarkInvalid/Logout из других
+// горутин. Именно так этот метод и используется как TokenProvider для
+// helix.Client (см. main.go) — там нет UI-контекста для интерактивного
+// входа, и его там не должно быть: не тот вызывающий код.
 func (s *AuthService) EnsureAuthenticated(onPrompt func(userCode, verificationURI string)) (domain.Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -74,13 +116,36 @@ func (s *AuthService) EnsureAuthenticated(onPrompt func(userCode, verificationUR
 		return token, nil
 	}
 
-	token, err := s.flow.Authorize(onPrompt)
+	if onPrompt == nil {
+		return domain.Token{}, ErrNoReusableToken
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancelMu.Lock()
+	s.cancelAuthorize = cancel
+	s.cancelMu.Unlock()
+	defer func() {
+		s.cancelMu.Lock()
+		s.cancelAuthorize = nil
+		s.cancelMu.Unlock()
+		cancel() // на случай успешного/неуспешного возврата без отмены — не течь context'ами
+	}()
+
+	token, err := s.flow.Authorize(ctx, onPrompt)
 	if err != nil {
 		return domain.Token{}, fmt.Errorf("authorize: %v", err)
 	}
 
 	if err := s.store.Save(token); err != nil {
-		return domain.Token{}, fmt.Errorf("save token: %v", err)
+		// Пользователь только что прошёл полный интерактивный вход в
+		// браузере, Twitch выдал рабочий токен — терять его из-за того,
+		// что диск не принял запись, нельзя ни в коем случае: без этого
+		// пользователь и поработать не смог бы (токен потерян), и
+		// заново логиниться пришлось бы на пустом месте. Персистентность
+		// — это только про переживание перезапуска, а не про то, можно
+		// ли пользоваться токеном прямо сейчас; теряем её одну, а не всё
+		// сразу.
+		log.Println("сохранить токен:", err)
 	}
 
 	s.invalidAccessToken = ""
@@ -92,10 +157,7 @@ func (s *AuthService) EnsureAuthenticated(onPrompt func(userCode, verificationUR
 // интерактивный AuthFlow. Нужен composition root'у: на старте
 // приложения можно попробовать тихо войти по тому, что уже сохранено
 // с прошлого раза, и только если это не получилось — показать
-// пользователю способ войти самому. Вызывать EnsureAuthenticated(nil)
-// для этого нельзя: при отсутствии годного токена он молча уйдёт в
-// Device Code Flow без единого способа показать код пользователю и
-// зависнет там до таймаута (см. комментарий у AuthService).
+// пользователю способ войти самому.
 func (s *AuthService) TryReuse() (domain.Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -160,9 +222,25 @@ func (s *AuthService) MarkInvalid(tok domain.Token) {
 
 // Logout удаляет сохранённый токен, вынуждая пройти авторизацию заново
 // при следующем вызове EnsureAuthenticated.
+//
+// Если прямо сейчас где-то идёт интерактивный AuthFlow (пользователь
+// ещё не ввёл код, EnsureAuthenticated стоит внутри Authorize и держит
+// s.mu) — сначала отменяем его через ctx (см. cancelAuthorize), и
+// только потом идём за s.mu: иначе Logout сам встал бы в очередь за
+// тем же локом и ждал бы, пока не истечёт таймаут device code, — то
+// самое "отменить вход невозможно в принципе", которого эта отмена и
+// призвана избежать. cancelMu, а не s.mu — намеренно, см. комментарий
+// у поля cancelAuthorize.
 func (s *AuthService) Logout() error {
+	s.cancelMu.Lock()
+	if s.cancelAuthorize != nil {
+		s.cancelAuthorize()
+	}
+	s.cancelMu.Unlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.invalidAccessToken = ""
 	return s.store.Clear()
 }

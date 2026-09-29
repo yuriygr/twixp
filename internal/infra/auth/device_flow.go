@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -102,10 +103,34 @@ func (t tokenResponse) toDomain() domain.Token {
 	}
 }
 
-// Authorize реализует app.AuthFlow.
-func (f *DeviceFlow) Authorize(onPrompt func(userCode, verificationURI string)) (domain.Token, error) {
+// postForm — тот же PostForm у http.Client, но с context: ctx.Done()
+// обрывает запрос на лету (не только между попытками — см. ctx.Done()
+// в pollForToken), а не только не даёт запустить следующий.
+// postForm — тот же PostForm у http.Client, но с context: ctx.Done()
+// обрывает запрос на лету (не только между попытками — см. ctx.Done()
+// в pollForToken), а не только не даёт запустить следующий.
+//
+// req.WithContext(ctx), а не http.NewRequestWithContext — последний
+// появился только в Go 1.13, а реальная сборка этого проекта идёт
+// настоящим Go 1.10.8 (см. Makefile/Readme) — на нём его просто нет.
+// http.NewRequest + WithContext делает то же самое, доступен с Go 1.7.
+func (f *DeviceFlow) postForm(ctx context.Context, targetURL string, form url.Values) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, targetURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return f.HTTP.Do(req)
+}
+
+// Authorize реализует app.AuthFlow. ctx позволяет прервать долгий
+// (до нескольких минут — pollForToken ждёт, пока пользователь введёт
+// код или истечёт таймаут Twitch) цикл опроса снаружи — см.
+// AuthService.Logout, который отменяет его при выходе.
+func (f *DeviceFlow) Authorize(ctx context.Context, onPrompt func(userCode, verificationURI string)) (domain.Token, error) {
 	log.Println("device flow: запрашиваю device code у", f.DeviceCodeURL)
-	dc, err := f.requestDeviceCode()
+	dc, err := f.requestDeviceCode(ctx)
 	if err != nil {
 		log.Println("device flow: requestDeviceCode провалился:", err)
 		return domain.Token{}, fmt.Errorf("request device code: %v", err)
@@ -116,7 +141,7 @@ func (f *DeviceFlow) Authorize(onPrompt func(userCode, verificationURI string)) 
 		onPrompt(dc.UserCode, dc.VerificationURI)
 	}
 
-	tok, err := f.pollForToken(dc)
+	tok, err := f.pollForToken(ctx, dc)
 	if err != nil {
 		log.Println("device flow: pollForToken провалился:", err)
 		return domain.Token{}, fmt.Errorf("poll for token: %v", err)
@@ -126,12 +151,12 @@ func (f *DeviceFlow) Authorize(onPrompt func(userCode, verificationURI string)) 
 	return tok.toDomain(), nil
 }
 
-func (f *DeviceFlow) requestDeviceCode() (*deviceCodeResponse, error) {
+func (f *DeviceFlow) requestDeviceCode(ctx context.Context) (*deviceCodeResponse, error) {
 	form := url.Values{}
 	form.Set("client_id", f.ClientID)
 	form.Set("scopes", strings.Join(f.Scopes, " "))
 
-	resp, err := f.HTTP.PostForm(f.DeviceCodeURL, form)
+	resp, err := f.postForm(ctx, f.DeviceCodeURL, form)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +173,7 @@ func (f *DeviceFlow) requestDeviceCode() (*deviceCodeResponse, error) {
 	return &dc, nil
 }
 
-func (f *DeviceFlow) pollForToken(dc *deviceCodeResponse) (*tokenResponse, error) {
+func (f *DeviceFlow) pollForToken(ctx context.Context, dc *deviceCodeResponse) (*tokenResponse, error) {
 	interval := time.Duration(dc.Interval) * time.Second
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -156,14 +181,18 @@ func (f *DeviceFlow) pollForToken(dc *deviceCodeResponse) (*tokenResponse, error
 	deadline := time.Now().Add(time.Duration(dc.ExpiresIn) * time.Second)
 
 	for time.Now().Before(deadline) {
-		time.Sleep(interval)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
 
 		form := url.Values{}
 		form.Set("client_id", f.ClientID)
 		form.Set("device_code", dc.DeviceCode)
 		form.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 
-		resp, err := f.HTTP.PostForm(f.TokenURL, form)
+		resp, err := f.postForm(ctx, f.TokenURL, form)
 		if err != nil {
 			return nil, err
 		}
