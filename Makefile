@@ -57,12 +57,10 @@ help:
 vet-core:
 	$(GO) vet $(CORE_MOD) ./internal/domain/... ./internal/app/... ./internal/infra/...
 
-# Тесты пока есть только у internal/domain (см. domain/*_test.go —
-# чистые функции, перенесённые сюда именно затем, чтобы их вообще
-# можно было проверить без Windows/GOPATH-тулчейна, см. историю
-# коммитов). internal/app/internal/infra тоже в списке заранее —
-# добавить им тесты в будущем не потребует трогать Makefile, а без
-# тестов go test на пакете просто молча скажет "no test files".
+# Тесты ядра (domain/app/infra): чистая логика, которую можно проверить
+# без Windows и GOPATH-тулчейна. Пакеты без тестов go test просто
+# пропускает ("no test files"), так что список менять не нужно, когда
+# тесты появляются в новом пакете.
 test:
 	$(GO) test $(CORE_MOD) ./internal/domain/... ./internal/app/... ./internal/infra/...
 

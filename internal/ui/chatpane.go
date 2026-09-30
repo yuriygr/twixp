@@ -51,6 +51,15 @@ type chatPane struct {
 	replyBanner *walk.Composite
 	replyLabel  *walk.Label
 
+	// modeBar/modeLabel — тонкая строка над полем ввода с активными
+	// режимами чата канала ("Только смайлики · Медленный режим: 30 с"),
+	// скрыта, когда ограничений нет (см. updateModeBar). Намеренно без
+	// кнопок и отступов — заметно ниже replyBanner: это справочная
+	// подпись, а не элемент управления. AssignTo из declarative-дерева
+	// в build().
+	modeBar   *walk.Composite
+	modeLabel *walk.Label
+
 	window *walk.MainWindow // для Synchronize из горутин; выставляется в New() после build()
 	status statusReporter
 
@@ -143,6 +152,12 @@ type chatPane struct {
 	// область).
 	displayedChannelID string
 
+	// modes — последние известные режимы чата по каналам (см.
+	// app.ChatReader.ChatModes). Нулевое значение/отсутствие записи —
+	// "ограничений нет или пока не знаем", плашки тогда не показываются.
+	// Только из UI-потока.
+	modes map[string]domain.ChatModes
+
 	// replyTo — сообщение, на которое отвечаем следующей отправкой, из
 	// контекстного меню chatView ("Ответить"). nil — обычная отправка.
 	// Сбрасывается после отправки, явной отмены баннера и при
@@ -187,6 +202,7 @@ func newChatPane(status statusReporter, fetchIcon ImageFetcher) *chatPane {
 		status:              status,
 		fetchIcon:           fetchIcon,
 		history:             make(map[string][]chatLine),
+		modes:               make(map[string]domain.ChatModes),
 		watching:            make(map[string]uint64),
 		badgeURLs:           make(map[string]map[domain.Badge]string),
 		badgeURLsInFlight:   make(pendingSet),
@@ -316,6 +332,7 @@ func (p *chatPane) showChannel(channelID string) {
 	// прежде показанного канала, сохранять его тут было бы бессмысленно
 	// (см. chatView.setLines).
 	p.view.setLines(p.history[channelID], true)
+	p.updateModeBar()
 }
 
 // forget вычищает состояние канала, который только что удалили из
@@ -340,10 +357,12 @@ func (p *chatPane) forget(channelID string) {
 	delete(p.badgeURLs, channelID)
 	delete(p.chatters, channelID)
 	delete(p.watching, channelID)
+	delete(p.modes, channelID)
 
 	if p.displayedChannelID == channelID {
 		p.displayedChannelID = ""
 		p.view.setLines(nil, true) // true тут значения не имеет (nil-история и так пуста), но для единообразия с showChannel
+		p.updateModeBar()
 	}
 }
 
@@ -429,30 +448,31 @@ func (p *chatPane) recomputeDisplayedChannel() {
 // для всех открытых каналов одновременно, иначе сообщения неактивных
 // чатов просто некому было бы читать вообще.
 //
-// Единственная фоновая горутина на канал, читающая ОБА потока сразу
-// (обычные сообщения и удаления, см. app.ChatReader) — select между
-// двумя каналами, а не две отдельные горутины: тот же принцип "одна
-// горутина на подписку", что и раньше, просто теперь подписок для
-// одного канала физически три (см. eventsub.Hub.subscribe), а
+// Единственная фоновая горутина на канал, читающая ВСЕ потоки сразу
+// (обычные сообщения, удаления и режимы чата, см. app.ChatReader) —
+// select между каналами, а не отдельные горутины: тот же принцип
+// "одна горутина на подписку", что и раньше, просто теперь подписок
+// для одного канала физически четыре (см. eventsub.Hub.subscribe), а
 // горутина-читатель на стороне UI как была одна, так и осталась.
 //
-// messages/deletions поочерёдно зануляются при закрытии, а не просто
+// messages/deletions/modes поочерёдно зануляются при закрытии, а не просто
 // помечаются через ok — это не косметика: nil-канал в select блокирует
 // именно тот case навсегда (сам select при этом продолжает ждать
 // оставшийся живой канал), поэтому обнуление и есть единственный
 // способ перестать получать по нему `ok=false` на каждой следующей
 // итерации, не проверяя явно два bool'а в условии цикла. Условие
-// `messages != nil || deletions != nil` — это и есть "жив хотя бы один
-// из двух"; когда оба станут nil, оно ложно, и цикл завершается сам, а
+// `messages != nil || deletions != nil || modes != nil` — это и есть
+// "жив хотя бы один"; когда все станут nil, оно ложно, и цикл завершается сам, а
 // не блокируется навечно (два nil-канала в select с бесконечным
-// select{} без этого условия висели бы вечно). На практике оба закрываются
-// одновременно в Hub.dropChannel, но раздельная проверка не помешает,
-// если это когда-нибудь перестанет быть так.
+// select{} без этого условия висели бы вечно). На практике все
+// закрываются одновременно в Hub.dropChannel, но раздельная проверка не
+// помешает, если это когда-нибудь перестанет быть так.
 func (p *chatPane) watchMessages(channelID string, gen uint64, service *app.ChatService) {
 	messages := service.Messages()
 	deletions := service.Deletions()
+	modes := service.ChatModes()
 
-	for messages != nil || deletions != nil {
+	for messages != nil || deletions != nil || modes != nil {
 		select {
 		case msg, ok := <-messages:
 			if !ok {
@@ -466,6 +486,12 @@ func (p *chatPane) watchMessages(channelID string, gen uint64, service *app.Chat
 				continue
 			}
 			p.deleteMessage(channelID, del.MessageID)
+		case m, ok := <-modes:
+			if !ok {
+				modes = nil
+				continue
+			}
+			p.applyModes(channelID, m)
 		}
 	}
 
@@ -480,6 +506,33 @@ func (p *chatPane) watchMessages(channelID string, gen uint64, service *app.Chat
 			delete(p.watching, channelID)
 		}
 	})
+}
+
+// applyModes запоминает новые режимы чата канала и, если этот канал
+// сейчас показан, обновляет полосу над полем ввода. Вызывается из
+// горутины-читателя, поэтому всё — через Synchronize.
+func (p *chatPane) applyModes(channelID string, m domain.ChatModes) {
+	p.window.Synchronize(func() {
+		if _, open := p.watching[channelID]; !open {
+			return // канал успели закрыть — запись в modes осталась бы навсегда
+		}
+		p.modes[channelID] = m
+		if p.displayedChannelID == channelID {
+			p.updateModeBar()
+		}
+	})
+}
+
+// updateModeBar показывает в полосе режимы показанного сейчас канала
+// либо прячет её, если ограничений нет. Только из UI-потока.
+func (p *chatPane) updateModeBar() {
+	labels := p.modes[p.displayedChannelID].Labels()
+	if len(labels) == 0 {
+		p.modeBar.SetVisible(false)
+		return
+	}
+	p.modeLabel.SetText(strings.Join(labels, " · "))
+	p.modeBar.SetVisible(true)
 }
 
 // deleteMessage помечает сообщение с данным ID как удалённое (см.
@@ -537,7 +590,7 @@ func (p *chatPane) appendMessage(channelID string, msg domain.ChatMessage) {
 		Mentioned:     mentioned,
 		Badges:        msg.Badges,
 		ReplyTo:       msg.ReplyTo,
-		Highlighted:   msg.Highlighted,
+		Redemption:    msg.Redemption,
 		SystemMessage: msg.SystemMessage,
 	}
 

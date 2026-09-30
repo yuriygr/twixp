@@ -111,6 +111,25 @@ func buildChatPage(m *MainWindow) pageFactory {
 							// WM_VSCROLL, см. chatview.go.
 							Style: win.WS_VSCROLL,
 						},
+						// Полоса режимов чата ("Только смайлики · ...") —
+						// одна строка мелкого серого текста с минимальными
+						// отступами, заметно ниже replyBanner ниже (там
+						// ещё и кнопка отмены). Скрыта, пока у канала нет
+						// ограничений, см. chatPane.updateModeBar.
+						declarative.Composite{
+							AssignTo: &m.chatPane.modeBar,
+							Visible:  false,
+							Layout: declarative.HBox{
+								Margins:     declarative.Margins{Left: 4, Top: 0, Right: 4, Bottom: 1},
+								SpacingZero: true,
+							},
+							Children: []declarative.Widget{
+								declarative.Label{
+									AssignTo:  &m.chatPane.modeLabel,
+									TextColor: walk.RGB(96, 96, 96),
+								},
+							},
+						},
 						declarative.Composite{
 							AssignTo: &m.chatPane.replyBanner,
 							Visible:  false,

@@ -49,10 +49,11 @@ type ChatMessage struct {
 	SentAt  time.Time
 	// ReplyTo — см. одноимённый тип. nil, если это не ответ.
 	ReplyTo *ReplyTo
-	// Highlighted — оплачено ли сообщение баллами канала для
-	// подсветки ("Highlight My Message", EventSub
-	// message_type == "channel_points_highlighted").
-	Highlighted bool
+	// Redemption — если сообщение отправлено за баллы канала (а не
+	// обычным образом), какое именно действие оплачено (EventSub
+	// message_type, см. PointsRedemption). NoRedemption — обычное
+	// сообщение.
+	Redemption PointsRedemption
 	// SystemMessage — готовый человекочитаемый текст системного
 	// уведомления о событии в чате (Twitch сам формирует его — не
 	// нужно самим собирать фразу из notice_type/resub/sub_gift и

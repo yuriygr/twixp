@@ -245,6 +245,71 @@ func (c *Client) CreateChatMessageDeleteSubscription(sessionID string, broadcast
 	return c.createChatSubscription("channel.chat.message_delete", sessionID, broadcaster, viewer)
 }
 
+// CreateChatSettingsSubscription — то же самое, но на изменения
+// режимов чата (только смайлики, только подписчики, медленный режим и
+// т.п. — EventSub channel.chat_settings.update, см.
+// eventsub/message.go decodeChatSettingsUpdate). Тот же scope
+// (user:read:chat), что и у остальных — заново входить не нужно.
+func (c *Client) CreateChatSettingsSubscription(sessionID string, broadcaster domain.Channel, viewer domain.User) (string, error) {
+	return c.createChatSubscription("channel.chat_settings.update", sessionID, broadcaster, viewer)
+}
+
+// chatSettingsResponse — тело ответа Get Chat Settings. Только поля,
+// доступные без прав модератора (non_moderator_chat_delay* требуют
+// moderator:read:chat_settings и нам не нужны). Длительности — nil,
+// когда соответствующий режим выключен.
+type chatSettingsResponse struct {
+	Data []struct {
+		EmoteMode            bool `json:"emote_mode"`
+		FollowerMode         bool `json:"follower_mode"`
+		FollowerModeDuration *int `json:"follower_mode_duration"` // минуты
+		SlowMode             bool `json:"slow_mode"`
+		SlowModeWaitTime     *int `json:"slow_mode_wait_time"` // секунды
+		SubscriberMode       bool `json:"subscriber_mode"`
+		UniqueChatMode       bool `json:"unique_chat_mode"`
+	} `json:"data"`
+}
+
+// GetChatModes возвращает текущие режимы чата канала — начальное
+// состояние для плашек; дальнейшие изменения приходят по подписке
+// (CreateChatSettingsSubscription). Права модератора не нужны:
+// без moderator_id Twitch отдаёт всё, кроме модераторских полей.
+func (c *Client) GetChatModes(broadcaster domain.Channel) (domain.ChatModes, error) {
+	resp, err := c.do("GET", "/chat/settings", url.Values{"broadcaster_id": {broadcaster.ID}}, nil)
+	if err != nil {
+		return domain.ChatModes{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return domain.ChatModes{}, decodeAPIError(resp)
+	}
+
+	var out chatSettingsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return domain.ChatModes{}, err
+	}
+	if len(out.Data) == 0 {
+		return domain.ChatModes{}, fmt.Errorf("chat settings: пустой ответ")
+	}
+
+	d := out.Data[0]
+	modes := domain.ChatModes{
+		EmoteOnly:       d.EmoteMode,
+		SubscribersOnly: d.SubscriberMode,
+		FollowersOnly:   d.FollowerMode,
+		SlowMode:        d.SlowMode,
+		UniqueOnly:      d.UniqueChatMode,
+	}
+	if d.FollowerModeDuration != nil {
+		modes.FollowersMinutes = *d.FollowerModeDuration
+	}
+	if d.SlowModeWaitTime != nil {
+		modes.SlowSeconds = *d.SlowModeWaitTime
+	}
+	return modes, nil
+}
+
 func (c *Client) createChatSubscription(subType, sessionID string, broadcaster domain.Channel, viewer domain.User) (string, error) {
 	body := createSubscriptionRequest{
 		Type:    subType,

@@ -46,18 +46,18 @@ type chatLine struct {
 	// chatpane.go). Красится едва красноватым фоном (см. mentionBgColor)
 	// с чуть более красной рамкой слева (см. mentionBorderColor)
 	Mentioned bool
-	// Highlighted — сообщение оплачено баллами канала для подсветки
-	// ("Highlight My Message", см. domain.ChatMessage.Highlighted).
-	// Рисуется фиолетовой полосой слева (см. highlightBorderColor) и
-	// строкой "Redeemed Highlight My Message" сверху — в том же месте
-	// раскладки, что и баннер ответа (см. lineLayout.reply), только
-	// вместо него: сообщение не может одновременно показывать оба
-	// баннера (см. bannerText в chatview.go).
-	Highlighted bool
+	// Redemption — сообщение отправлено за баллы канала ("Выделить моё
+	// сообщение", "Сообщение в режиме только для подписчиков", см.
+	// domain.PointsRedemption). Рисуется фиолетовой полосой слева (см.
+	// highlightBorderColor) и строкой с названием действия сверху — в
+	// том же месте раскладки, что и баннер ответа (см.
+	// lineLayout.reply), только вместо него: сообщение не может
+	// одновременно показывать оба баннера (см. bannerTextFor).
+	Redemption domain.PointsRedemption
 	// SystemMessage — если не пусто, вся строка — не обычное
 	// сообщение, а системное уведомление о событии в чате (подписка,
 	// рейд и т.п. — см. domain.ChatMessage.SystemMessage). В этом
-	// случае Author/Badges/ReplyTo/Highlighted не используются: вся
+	// случае Author/Badges/ReplyTo/Redemption не используются: вся
 	// строка — просто SystemMessage серым курсивом (см. drawLine).
 	SystemMessage string
 	// Deleted — сообщение удалено модератором/ботом (EventSub
@@ -92,8 +92,10 @@ const (
 	// Постарался подобрать сочетание цветов как в вебе.
 	mentionBorderColor walk.Color = 255 | 125<<8 | 125<<16
 	// highlightBorderColor — цвет полосы слева у оплаченных баллами
-	// сообщений (см. chatLine.Highlighted). Тот же лиловый оттенок,
-	// каким Twitch выделяет "Highlight My Message" в вебе.
+	// сообщений (см. chatLine.Redemption). Тот же лиловый оттенок,
+	// каким Twitch выделяет "Highlight My Message" в вебе; тем же
+	// цветом помечаем и остальные действия за баллы — это одно и то
+	// же "оплачено баллами канала".
 	highlightBorderColor walk.Color = 145 | 71<<8 | 255<<16
 	// systemMessageColor — цвет текста системных уведомлений (см.
 	// chatLine.SystemMessage). Тот же серый, что и у времени — то же
@@ -202,7 +204,7 @@ type chatView struct {
 	mentionBorderBrush walk.Brush
 
 	// highlightBorderBrush — кисть лиловой полосы слева у сообщений,
-	// оплаченных баллами канала (см. chatLine.Highlighted).
+	// оплаченных баллами канала (см. chatLine.Redemption).
 	highlightBorderBrush walk.Brush
 
 	// unreadBrush — кисть фона плашки "↓ N новых сообщений" (см.
@@ -1071,15 +1073,16 @@ func (v *chatView) layoutLine(canvas *walk.Canvas, font *walk.Font, line chatLin
 }
 
 // bannerTextFor — текст серой строки НАД основной строкой сообщения
-// (см. lineLayout.reply): либо "Использовано: Выделить моё сообщение" (см.
-// chatLine.Highlighted), либо "Ответ Автору: ..." (см. chatLine.ReplyTo).
-// Приоритет — Highlighted: оплаченное баллами выделение — более редкое
-// и более "заметное" (платное) действие, чем обычный ответ, так что
-// если оба почему-то совпали на одном сообщении, показываем именно его.
+// (см. lineLayout.reply): либо название оплаченного баллами действия
+// (см. chatLine.Redemption и domain.PointsRedemption.Label), либо
+// "Ответ Автору: ..." (см. chatLine.ReplyTo). Приоритет — оплата
+// баллами: она более редкое и более "заметное" (платное) действие, чем
+// обычный ответ, так что если оба почему-то совпали на одном
+// сообщении, показываем именно её.
 // ok=false — баннера нет вообще, mainY в layoutLine остаётся 0.
 func bannerTextFor(line chatLine) (text string, ok bool) {
-	if line.Highlighted {
-		return "Использовано: Выделить моё сообщение", true
+	if label := line.Redemption.Label(); label != "" {
+		return label, true
 	}
 	if line.ReplyTo != nil {
 		return domain.ReplyLineText(line.ReplyTo), true
@@ -1321,7 +1324,7 @@ func (v *chatView) drawLine(canvas *walk.Canvas, font *walk.Font, line chatLine,
 		}
 	}
 
-	if line.Highlighted && v.highlightBorderBrush != nil {
+	if line.Redemption != domain.NoRedemption && v.highlightBorderBrush != nil {
 		border := walk.Rectangle{X: 0, Width: borderWidth, Height: layout.height}
 		if err := canvas.FillRectangle(v.highlightBorderBrush, at(border)); err != nil {
 			return err

@@ -70,6 +70,11 @@ func (s *ChatService) Deletions() <-chan domain.MessageDeletion {
 	return s.reader.Deletions()
 }
 
+// ChatModes отдаёт поток режимов чата (см. ChatReader.ChatModes).
+func (s *ChatService) ChatModes() <-chan domain.ChatModes {
+	return s.reader.ChatModes()
+}
+
 // Send отправляет сообщение в текущий подключённый канал.
 // replyToMessageID — ID сообщения, на которое отвечаем, либо "" для
 // обычного сообщения (не Twitch-реплая).

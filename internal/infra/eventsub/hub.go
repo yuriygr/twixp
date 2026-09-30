@@ -55,6 +55,14 @@ type SubscriptionManager interface {
 	// eventsub/message.go decodeMessageDelete). Тот же scope, что и у
 	// CreateChatSubscription.
 	CreateChatMessageDeleteSubscription(sessionID string, broadcaster domain.Channel, viewer domain.User) (subscriptionID string, err error)
+	// CreateChatSettingsSubscription — отдельная подписка на изменения
+	// режимов чата (только смайлики, только подписчики, медленный
+	// режим и т.п., см. eventsub/message.go decodeChatSettingsUpdate).
+	// Тот же scope, что и у остальных.
+	CreateChatSettingsSubscription(sessionID string, broadcaster domain.Channel, viewer domain.User) (subscriptionID string, err error)
+	// GetChatModes — текущие режимы чата: начальное состояние, от
+	// которого дальше отсчитываются изменения по подписке выше.
+	GetChatModes(broadcaster domain.Channel) (domain.ChatModes, error)
 	DeleteSubscription(subscriptionID string) error
 }
 
@@ -127,11 +135,22 @@ type channelState struct {
 	// notificationSubscriptionID: пусто — просто без пометки удалённых
 	// сообщений для этого канала.
 	deleteSubscriptionID string
-	messages             chan domain.ChatMessage
+	// modesSubscriptionID — подписка на channel.chat_settings.update.
+	// Та же необязательность: пусто — просто без плашек режимов чата.
+	modesSubscriptionID string
+	messages            chan domain.ChatMessage
 	// deletions — отдельный поток "это сообщение удалено" (см.
 	// app.ChatReader.Deletions). Закрывается вместе с messages в
 	// dropChannel.
 	deletions chan domain.MessageDeletion
+	// modes — поток "режимы чата изменились" (см. app.ChatReader.
+	// ChatModes). Закрывается вместе с messages в dropChannel.
+	modes chan domain.ChatModes
+	// modesSeen — уже ли пришло хоть одно значение режимов (из
+	// подписки или начального запроса). Начальный запрос идёт
+	// параллельно подписке, и его ответ мог бы затереть более свежее
+	// событие, обогнавшее его; флаг это исключает. Защищён h.mu.
+	modesSeen bool
 }
 
 // NewHub создаёт Hub. viewer — авторизованный пользователь, от чьего
@@ -372,10 +391,11 @@ func (h *Hub) readLoop() {
 	}
 }
 
-// dispatch маршрутизирует уведомление по трём известным типам подписки
+// dispatch маршрутизирует уведомление по известным типам подписки
 // (channel.chat.message/notification — как раньше, единым путём через
-// dispatchMessage с разными декодерами; channel.chat.message_delete —
-// отдельно, в другой канал состояния, см. dispatchDeletion) —
+// dispatchMessage с разными декодерами; channel.chat.message_delete и
+// channel.chat_settings.update — отдельно, каждый в свой канал
+// состояния, см. dispatchDeletion и dispatchModes) —
 // неизвестный/пустой тип подписки идёт на прежний путь
 // (channel.chat.message), а не отбрасывается: так было и до появления
 // notification/message_delete, лишняя строгость тут не нужна.
@@ -383,6 +403,8 @@ func (h *Hub) dispatch(env eventSubEnvelope) {
 	switch env.Payload.Subscription.Type {
 	case "channel.chat.message_delete":
 		h.dispatchDeletion(env)
+	case "channel.chat_settings.update":
+		h.dispatchModes(env)
 	case "channel.chat.notification":
 		h.dispatchMessage(env, decodeChatNotification)
 	default:
@@ -450,6 +472,67 @@ func (h *Hub) dispatchDeletion(env eventSubEnvelope) {
 		default:
 		}
 	}
+}
+
+// dispatchModes — изменение режимов чата пришло по подписке.
+func (h *Hub) dispatchModes(env eventSubEnvelope) {
+	modes, broadcasterID, err := decodeChatSettingsUpdate(env)
+	if err != nil {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	state, ok := h.channels[broadcasterID]
+	if !ok {
+		return
+	}
+
+	state.modesSeen = true
+	sendModesLocked(state, modes)
+}
+
+// sendModesLocked кладёт режимы в канал состояния, вытесняя самое
+// старое значение при переполнении (тот же приём, что dispatchMessage:
+// зависший потребитель не должен блокировать read-loop). Для режимов
+// важно только последнее значение, так что вытеснение старого ничего
+// не теряет. Вызывающий код держит h.mu.
+func sendModesLocked(state *channelState, modes domain.ChatModes) {
+	select {
+	case state.modes <- modes:
+	default:
+		select {
+		case <-state.modes:
+		default:
+		}
+		select {
+		case state.modes <- modes:
+		default:
+		}
+	}
+}
+
+// loadInitialModes запрашивает текущие режимы чата (подписка сообщает
+// только об ИЗМЕНЕНИЯХ) и отдаёт их потребителю, если за это время не
+// пришло более свежее событие по подписке и канал не закрыли. Сбой
+// запроса не критичен: плашки просто появятся с первым изменением.
+// Сеть — вне h.mu, как и везде в хабе.
+func (h *Hub) loadInitialModes(state *channelState) {
+	modes, err := h.subs.GetChatModes(state.channel)
+	if err != nil {
+		log.Printf("режимы чата канала %s: %v", state.channel.Name, err)
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.channels[state.channel.ID] != state || state.modesSeen {
+		return
+	}
+	state.modesSeen = true
+	sendModesLocked(state, modes)
 }
 
 func (h *Hub) handleDisconnect() {
@@ -525,11 +608,23 @@ func (h *Hub) resubscribeAll() {
 			log.Printf("подписка на удаление сообщений канала %s: %v", s.channel.Name, err)
 		}
 
+		// Режимы чата — та же необязательность.
+		modesID, err := h.subs.CreateChatSettingsSubscription(sessionID, s.channel, h.viewer)
+		if err != nil {
+			log.Printf("подписка на режимы чата канала %s: %v", s.channel.Name, err)
+		}
+
 		h.mu.Lock()
 		s.subscriptionID = subID
 		s.notificationSubscriptionID = notifID
 		s.deleteSubscriptionID = deleteID
+		s.modesSubscriptionID = modesID
+		// Пока соединения не было, режимы могли поменяться, а события
+		// мы не получали — запрашиваем состояние заново.
+		s.modesSeen = false
 		h.mu.Unlock()
+
+		go h.loadInitialModes(s)
 	}
 }
 
@@ -552,6 +647,7 @@ func (h *Hub) dropChannel(channelID string) (*channelState, bool) {
 	delete(h.channels, channelID)
 	close(state.messages)
 	close(state.deletions)
+	close(state.modes)
 	return state, true
 }
 
@@ -632,18 +728,32 @@ func (h *Hub) subscribe(channel domain.Channel) (*channelState, error) {
 		log.Printf("подписка на удаление сообщений канала %s: %v", channel.Name, err)
 	}
 
+	// Режимы чата (только смайлики, только подписчики и т.п.) — та же
+	// необязательность (см. helix.Client.CreateChatSettingsSubscription).
+	modesID, err := h.subs.CreateChatSettingsSubscription(sessionID, channel, h.viewer)
+	if err != nil {
+		log.Printf("подписка на режимы чата канала %s: %v", channel.Name, err)
+	}
+
 	state := &channelState{
 		channel:                    channel,
 		subscriptionID:             subID,
 		notificationSubscriptionID: notifID,
 		deleteSubscriptionID:       deleteID,
+		modesSubscriptionID:        modesID,
 		messages:                   make(chan domain.ChatMessage, messageBufferSize),
 		deletions:                  make(chan domain.MessageDeletion, messageBufferSize),
+		modes:                      make(chan domain.ChatModes, messageBufferSize),
 	}
 
 	h.mu.Lock()
 	h.channels[channel.ID] = state
 	h.mu.Unlock()
+
+	// Подписка уже создана, канал в реестре — теперь можно узнать
+	// начальное состояние (порядок именно такой, чтобы не пропустить
+	// изменение между запросом и подпиской).
+	go h.loadInitialModes(state)
 
 	return state, nil
 }
@@ -660,6 +770,7 @@ func (h *Hub) unsubscribe(channelID string) error {
 
 	h.deleteIfSet(state.notificationSubscriptionID, &err)
 	h.deleteIfSet(state.deleteSubscriptionID, &err)
+	h.deleteIfSet(state.modesSubscriptionID, &err)
 
 	return err
 }

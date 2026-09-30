@@ -49,8 +49,9 @@ type eventSubEnvelope struct {
 				ParentMessage   string `json:"parent_message_body"`
 			} `json:"reply"`
 			// MessageType — только у channel.chat.message. "text" — обычное
-			// сообщение; "channel_points_highlighted" — оплачено баллами
-			// канала для подсветки ("Highlight My Message"). Остальные
+			// сообщение; "channel_points_highlighted" и
+			// "channel_points_sub_only" — оплачено баллами канала (см.
+			// domain.PointsRedemptionFromMessageType). Остальные
 			// значения (user_intro и т.п.) сейчас не различаем.
 			MessageType string `json:"message_type"`
 			// SystemMessage — только у channel.chat.notification: готовый
@@ -63,6 +64,16 @@ type eventSubEnvelope struct {
 			TargetUserID    string `json:"target_user_id"`
 			TargetUserLogin string `json:"target_user_login"`
 			TargetUserName  string `json:"target_user_name"`
+			// Режимы чата — только у channel.chat_settings.update (см.
+			// decodeChatSettingsUpdate). Длительности — nil, когда
+			// соответствующий режим выключен.
+			EmoteMode            bool `json:"emote_mode"`
+			FollowerMode         bool `json:"follower_mode"`
+			FollowerModeDuration *int `json:"follower_mode_duration_minutes"`
+			SlowMode             bool `json:"slow_mode"`
+			SlowModeWaitTime     *int `json:"slow_mode_wait_time_seconds"`
+			SubscriberMode       bool `json:"subscriber_mode"`
+			UniqueChatMode       bool `json:"unique_chat_mode"`
 		} `json:"event"`
 		Subscription struct {
 			// Type — тип EventSub-подписки, которой принадлежит это
@@ -142,7 +153,7 @@ func decodeChatMessage(env eventSubEnvelope) (domain.ChatMessage, string, error)
 			Text:        e.Reply.ParentMessage,
 		}
 	}
-	msg.Highlighted = e.MessageType == "channel_points_highlighted"
+	msg.Redemption = domain.PointsRedemptionFromMessageType(e.MessageType)
 
 	return msg, broadcasterID, nil
 }
@@ -150,7 +161,7 @@ func decodeChatMessage(env eventSubEnvelope) (domain.ChatMessage, string, error)
 // decodeChatNotification превращает payload.event уведомления
 // channel.chat.notification (подписка, подарок подписки, рейд,
 // объявление и т.п. — EventSub USERNOTICE-замена) в domain.ChatMessage
-// с заполненным SystemMessage. ReplyTo/Highlighted тут не при делах —
+// с заполненным SystemMessage. ReplyTo/Redemption тут не при делах —
 // уведомление не является ни ответом, ни оплаченным за баллы обычным
 // сообщением, поэтому в decodeCommonFields их и нет вовсе.
 func decodeChatNotification(env eventSubEnvelope) (domain.ChatMessage, string, error) {
@@ -176,6 +187,33 @@ func decodeMessageDelete(env eventSubEnvelope) (domain.MessageDeletion, string, 
 	}
 
 	return domain.MessageDeletion{MessageID: e.MessageID}, e.BroadcasterUserID, nil
+}
+
+// decodeChatSettingsUpdate превращает payload.event изменения режимов
+// чата (channel.chat_settings.update) в domain.ChatModes. Событие
+// всегда несёт ПОЛНОЕ текущее состояние всех режимов, а не только
+// изменившийся, поэтому потребителю достаточно просто заменить
+// прежнее значение новым.
+func decodeChatSettingsUpdate(env eventSubEnvelope) (domain.ChatModes, string, error) {
+	e := env.Payload.Event
+	if e.BroadcasterUserID == "" {
+		return domain.ChatModes{}, "", fmt.Errorf("missing broadcaster_user_id")
+	}
+
+	modes := domain.ChatModes{
+		EmoteOnly:       e.EmoteMode,
+		SubscribersOnly: e.SubscriberMode,
+		FollowersOnly:   e.FollowerMode,
+		SlowMode:        e.SlowMode,
+		UniqueOnly:      e.UniqueChatMode,
+	}
+	if e.FollowerModeDuration != nil {
+		modes.FollowersMinutes = *e.FollowerModeDuration
+	}
+	if e.SlowModeWaitTime != nil {
+		modes.SlowSeconds = *e.SlowModeWaitTime
+	}
+	return modes, e.BroadcasterUserID, nil
 }
 
 // parseSentAt разбирает metadata.message_timestamp — момент, когда

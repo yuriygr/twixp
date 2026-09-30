@@ -44,6 +44,14 @@ func (r *hubReader) Deletions() <-chan domain.MessageDeletion {
 	return r.state.deletions
 }
 
+// ChatModes реализует app.ChatReader.
+func (r *hubReader) ChatModes() <-chan domain.ChatModes {
+	if r.state == nil {
+		return nil
+	}
+	return r.state.modes
+}
+
 // Close реализует app.ChatReader.
 func (r *hubReader) Close() error {
 	if r.state == nil {
