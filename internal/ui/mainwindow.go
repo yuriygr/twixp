@@ -173,10 +173,6 @@ type MainWindow struct {
 	// смотрит на этот флаг, чтобы отличить "спрятать в трей" от
 	// "действительно выйти", и во втором случае не перехватывать закрытие.
 	exiting bool
-	// trayHintShown — показывали ли уже баллон "приложение продолжает
-	// работать в трее" — один раз за сессию, при первом сворачивании, а
-	// не при каждом.
-	trayHintShown bool
 }
 
 // New строит окно (но не запускает событийный цикл — см. Run) вместе
@@ -373,8 +369,15 @@ func (m *MainWindow) onWindowClosing(canceled *bool, reason walk.CloseReason) {
 	*canceled = true
 	m.window.SetVisible(false)
 
-	if !m.trayHintShown && m.trayIcon != nil {
-		m.trayHintShown = true
+	if !m.settings.TrayHintShown && m.trayIcon != nil {
+		// Запоминаем навсегда (в настройках на диске), а не на сессию —
+		// подсказка показывается только при самом первом сворачивании.
+		m.settings.TrayHintShown = true
+		if m.saveSettings != nil {
+			if err := m.saveSettings(m.settings); err != nil {
+				log.Println("сохранить флаг подсказки трея:", err)
+			}
+		}
 		_ = m.trayIcon.ShowInfo("TwiXP", `Приложение продолжает работать в трее. Чтобы закрыть его полностью, кликните правой кнопкой по значку и выберите "Выход".`)
 	}
 }

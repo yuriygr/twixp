@@ -22,6 +22,15 @@ GO_XP     ?= go1.10.8
 BIN_DIR   ?= bin
 GOPATH_XP ?= $(CURDIR)/.gopath-xp
 
+# Ядро проверяется с отдельным минимальным go.core.mod, а не с основным
+# go.mod: в том прописаны replace на ../github.com/lxn/walk и прочие
+# GUI-зависимости (нужны редактору/gopls, см. комментарий в go.mod), а
+# современный go проверяет их наличие на диске при ЛЮБОЙ команде — даже
+# если пакет их не импортирует. На чистой машине/в CI этих каталогов
+# нет, и go vet падал бы ещё до начала проверки. У ядра внешних
+# зависимостей нет вовсе, поэтому его modfile — просто имя модуля.
+CORE_MOD = -modfile=go.core.mod
+
 # Коммиты — "канун 24.08.2018": последние перед тем, как lxn/walk начал
 # использовать strings.ReplaceAll (Go 1.12), несовместимое с целевым
 # Go 1.10.8.
@@ -46,7 +55,7 @@ help:
 # --- Ядро --------------------------------------------------------------
 
 vet-core:
-	$(GO) vet ./internal/domain/... ./internal/app/... ./internal/infra/...
+	$(GO) vet $(CORE_MOD) ./internal/domain/... ./internal/app/... ./internal/infra/...
 
 # Тесты пока есть только у internal/domain (см. domain/*_test.go —
 # чистые функции, перенесённые сюда именно затем, чтобы их вообще
@@ -55,7 +64,7 @@ vet-core:
 # добавить им тесты в будущем не потребует трогать Makefile, а без
 # тестов go test на пакете просто молча скажет "no test files".
 test:
-	$(GO) test ./internal/domain/... ./internal/app/... ./internal/infra/...
+	$(GO) test $(CORE_MOD) ./internal/domain/... ./internal/app/... ./internal/infra/...
 
 fmt:
 	@gofmt -l .
