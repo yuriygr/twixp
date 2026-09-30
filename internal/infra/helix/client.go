@@ -84,30 +84,82 @@ func (c *Client) GetAuthenticatedUser() (domain.User, error) {
 }
 
 func (c *Client) getUser(query url.Values) (domain.User, error) {
-	resp, err := c.do("GET", "/users", query, nil)
+	users, err := c.getUsers(query)
 	if err != nil {
 		return domain.User{}, err
+	}
+	if len(users) == 0 {
+		return domain.User{}, fmt.Errorf("user not found")
+	}
+	return users[0], nil
+}
+
+// getUsers — общая часть Get Users: возвращает всех найденных
+// пользователей (может быть меньше запрошенных — например, если
+// аккаунт удалён или заблокирован; пустой результат — не ошибка).
+func (c *Client) getUsers(query url.Values) ([]domain.User, error) {
+	resp, err := c.do("GET", "/users", query, nil)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return domain.User{}, decodeAPIError(resp)
+		return nil, decodeAPIError(resp)
 	}
 
 	var out usersResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return domain.User{}, err
-	}
-	if len(out.Data) == 0 {
-		return domain.User{}, fmt.Errorf("user not found")
+		return nil, err
 	}
 
-	return domain.User{
-		ID:          out.Data[0].ID,
-		Login:       out.Data[0].Login,
-		DisplayName: out.Data[0].DisplayName,
-		AvatarURL:   out.Data[0].ProfileImageURL,
-	}, nil
+	users := make([]domain.User, 0, len(out.Data))
+	for _, u := range out.Data {
+		users = append(users, domain.User{
+			ID:          u.ID,
+			Login:       u.Login,
+			DisplayName: u.DisplayName,
+			AvatarURL:   u.ProfileImageURL,
+		})
+	}
+	return users, nil
+}
+
+// maxUsersPerRequest — сколько id Twitch принимает в одном Get Users.
+const maxUsersPerRequest = 100
+
+// GetChannelsByIDs возвращает актуальные данные каналов по их ID —
+// для обновления того, что могло измениться с момента, когда канал
+// был добавлен (аватарка, отображаемое имя, логин). По ID, а не по
+// логину, потому что логин как раз и может смениться; ID — нет.
+//
+// Запрос идёт пачками по 100 (лимит Twitch), обычно это один вызов
+// на все каналы сразу. Каналы, которых Twitch не вернул (аккаунт
+// удалён или заблокирован), в результате просто отсутствуют.
+func (c *Client) GetChannelsByIDs(ids []string) ([]domain.Channel, error) {
+	var channels []domain.Channel
+
+	for start := 0; start < len(ids); start += maxUsersPerRequest {
+		end := start + maxUsersPerRequest
+		if end > len(ids) {
+			end = len(ids)
+		}
+
+		users, err := c.getUsers(url.Values{"id": ids[start:end]})
+		if err != nil {
+			return nil, err
+		}
+		for _, u := range users {
+			channels = append(channels, domain.Channel{
+				ID:          u.ID,
+				Name:        u.Login,
+				DisplayName: u.DisplayName,
+				AvatarURL:   u.AvatarURL,
+			})
+		}
+	}
+
+	return channels, nil
 }
 
 // GetChannelByLogin находит канал (вещателя) по логину — удобная

@@ -121,7 +121,7 @@ cp config.go.example config.go
 
 При первом запуске приложение покажет код и ссылку
 (`https://www.twitch.tv/activate`). Подтвердили на телефоне или другом
-компьютере — токен лёг в `data/state.json`, дальше вход тихий.
+компьютере — токен лёг в `%APPDATA%\TwiXP\token.bin` (зашифрован DPAPI), дальше вход тихий.
 
 ## Релизы
 
@@ -141,12 +141,29 @@ Settings → Secrets and variables → Actions → New repository secret →
 `config.go`: CI не может прочитать ваш незакоммиченный файл и берёт
 Client ID оттуда.
 
+## Где лежат данные
+
+Всё в профиле пользователя, `%APPDATA%\TwiXP` (на XP —
+`C:\Documents and Settings\<пользователь>\Application Data\TwiXP`):
+
+```
+state.json — настройки и список каналов (обычный читаемый JSON)
+token.bin  — OAuth-токен, зашифрованный Windows DPAPI под пользователя
+cache\     — кэш аватарок и иконок бейджей (до 20 МБ, лишнее вытесняется)
+twixp.log  — журнал
+```
+
+Кэш можно удалять целиком в любой момент — картинки скачаются заново.
+Ссылки на аватарки и имена открытых каналов обновляются через Twitch
+при запуске и раз в 12 часов, так что сменившаяся аватарка подтянется
+сама.
+
 ## Структура проекта
 
 ```
 internal/domain   — чистые типы данных (Channel, User, ChatMessage, Settings...)
 internal/app      — сценарии поверх domain (авторизация, отправка/чтение чата)
-internal/infra    — Twitch Helix/EventSub, хранилище на диске, TLS
+internal/infra    — Twitch Helix/EventSub, хранилище на диске, дисковый кэш картинок, TLS
 internal/ui       — вся отрисовка и виджеты (lxn/walk + сырой win32)
 ```
 
@@ -154,4 +171,3 @@ internal/ui       — вся отрисовка и виджеты (lxn/walk + с
 
 - Кликабельные ссылки в сообщениях
 - Смайлики Twitch и 7TV
-- Постоянный дисковый кэш аватарок и иконок бейджей

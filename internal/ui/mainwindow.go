@@ -596,6 +596,19 @@ func (m *MainWindow) NotifyChannelClosed(channel domain.Channel, reason string) 
 	})
 }
 
+// NotifyChannelsChanged сообщает, что данные открытых каналов
+// обновились не по действию пользователя (например, фоновое
+// обновление аватарок и имён после входа — см. main.go и
+// app.ChatWorkspace.RefreshProfiles), и список слева нужно
+// перерисовать. Безопасен для вызова из любой горутины, в том числе
+// до завершения входа (тогда sidebar просто ничего не делает — при
+// завершении входа список всё равно будет прочитан заново).
+func (m *MainWindow) NotifyChannelsChanged() {
+	m.window.Synchronize(func() {
+		m.sidebar.refreshChannels()
+	})
+}
+
 // logAndShowError — стандартный путь для рядовых ошибок выполнения
 // (не хватило сети на отправку, канал не нашёлся и т.п.): пишем в лог
 // (composition root настраивает его вывод в файл — окно

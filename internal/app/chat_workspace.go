@@ -124,6 +124,67 @@ func (w *ChatWorkspace) Add(channel domain.Channel) (*ChatService, error) {
 	return service, nil
 }
 
+// RefreshProfiles обновляет у открытых каналов то, что могло измениться
+// на стороне Twitch с момента добавления: аватарку, отображаемое имя и
+// логин. Без этого ссылка на аватарку, сохранённая при добавлении
+// канала, оставалась бы в state.json навсегда, и пользователь видел бы
+// старую картинку даже после того, как стример её сменил.
+//
+// lookup получает ID всех открытых каналов и возвращает их свежие
+// данные (см. helix.Client.GetChannelsByIDs); каналы, которых в ответе
+// нет, не трогаются. Сеть вызывается вне w.mu — так же, как в Add, чтобы
+// не замораживать остальные операции над workspace на время запроса.
+//
+// Возвращает true, если что-то реально изменилось (тогда onChanged уже
+// вызван со свежим снапшотом — список сохранится на диск, а UI стоит
+// перечитать список каналов).
+func (w *ChatWorkspace) RefreshProfiles(lookup func(ids []string) ([]domain.Channel, error)) (bool, error) {
+	current := w.List()
+	if len(current) == 0 {
+		return false, nil
+	}
+
+	ids := make([]string, len(current))
+	for i, ch := range current {
+		ids[i] = ch.ID
+	}
+
+	fresh, err := lookup(ids)
+	if err != nil {
+		return false, err
+	}
+
+	w.mu.Lock()
+	changed := false
+	for _, f := range fresh {
+		session, ok := w.sessions[f.ID]
+		if !ok {
+			continue // канал успели закрыть, пока шёл запрос
+		}
+		updated := session.channel
+		if f.Name != "" {
+			updated.Name = f.Name
+		}
+		if f.DisplayName != "" {
+			updated.DisplayName = f.DisplayName
+		}
+		if f.AvatarURL != "" {
+			updated.AvatarURL = f.AvatarURL
+		}
+		if updated != session.channel {
+			session.channel = updated
+			changed = true
+		}
+	}
+	snapshot := w.snapshotChannelsLocked()
+	w.mu.Unlock()
+
+	if changed {
+		w.notifyChanged(snapshot)
+	}
+	return changed, nil
+}
+
 // Remove закрывает и убирает канал из workspace. Если удалённый канал
 // был активным, активным не остаётся никто — какой канал сделать
 // активным дальше, решает вызывающий код (например, UI выбирает

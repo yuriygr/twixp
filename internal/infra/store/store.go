@@ -11,6 +11,7 @@ import (
 
 	"twixp/internal/app"
 	"twixp/internal/domain"
+	"twixp/internal/infra/atomicfile"
 )
 
 // Store — единственное окно для всего, что приложение сохраняет между
@@ -63,6 +64,16 @@ type state struct {
 // tokenMagic — первые байты token.bin: версия формата. Даёт возможность
 // однажды сменить схему шифрования и отличить старые файлы от новых.
 var tokenMagic = []byte("TXP1")
+
+// protectFn/unprotectFn — шифрование токена. В работе это DPAPI
+// (см. dpapi_windows.go); переменные, а не прямые вызовы, лишь затем,
+// чтобы тесты могли подставить простой обратимый "шифр" и проверить
+// остальную логику (миграцию, атомарность, обработку сбоев) на любой
+// платформе, не завися от Windows.
+var (
+	protectFn   = protect
+	unprotectFn = unprotect
+)
 
 // tokenEntropy — дополнительная "соль" для DPAPI, привязывающая блоб к
 // нашему приложению: другая программа того же пользователя не
@@ -143,7 +154,7 @@ func (s *Store) importLegacy(legacyDirs []string) string {
 			log.Printf("миграция: создать %s: %v", s.dir, err)
 			return ""
 		}
-		if err := writeFileAtomic(s.statePath(), data, 0600); err != nil {
+		if err := atomicfile.Write(s.statePath(), data); err != nil {
 			log.Printf("миграция: записать %s: %v", s.statePath(), err)
 			return ""
 		}
@@ -202,7 +213,7 @@ func (s *Store) readTokenFile() *domain.Token {
 		return nil
 	}
 
-	plain, err := unprotect(raw[len(tokenMagic):], tokenEntropy)
+	plain, err := unprotectFn(raw[len(tokenMagic):], tokenEntropy)
 	if err != nil {
 		log.Println("token.bin: не удалось расшифровать, потребуется новый вход:", err)
 		return nil
@@ -242,39 +253,6 @@ func (s *Store) adoptLegacyTokenLocked() error {
 	return nil
 }
 
-// writeFileAtomic пишет во временный файл рядом и переименовывает его
-// поверх целевого: обрыв питания или падение посередине записи не
-// оставит наполовину записанный (а значит нечитаемый) state.json или
-// token.bin — останется либо старая версия, либо новая целиком.
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
 // saveStateLocked пишет state.json целиком. Вызывающий код должен уже
 // держать s.mu — сам лок не берёт.
 func (s *Store) saveStateLocked() error {
@@ -287,7 +265,7 @@ func (s *Store) saveStateLocked() error {
 		return err
 	}
 
-	return writeFileAtomic(s.statePath(), data, 0600)
+	return atomicfile.Write(s.statePath(), data)
 }
 
 // saveTokenLocked шифрует s.token через DPAPI и пишет token.bin.
@@ -306,12 +284,12 @@ func (s *Store) saveTokenLocked() error {
 		return err
 	}
 
-	blob, err := protect(plain, tokenEntropy)
+	blob, err := protectFn(plain, tokenEntropy)
 	if err != nil {
 		return err
 	}
 
-	return writeFileAtomic(s.tokenPath(), append(append([]byte{}, tokenMagic...), blob...), 0600)
+	return atomicfile.Write(s.tokenPath(), append(append([]byte{}, tokenMagic...), blob...))
 }
 
 // ---------------------------------------------------------------

@@ -5,11 +5,12 @@ package main
 
 import (
 	"fmt"
-	"image"
-	_ "image/jpeg" // для image.Decode в fetchImage ниже
-	_ "image/png"
+	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"path/filepath"
+	"time"
 
 	"twixp/internal/app"
 	"twixp/internal/domain"
@@ -18,6 +19,7 @@ import (
 	"twixp/internal/infra/auth"
 	"twixp/internal/infra/eventsub"
 	"twixp/internal/infra/helix"
+	"twixp/internal/infra/imgcache"
 	"twixp/internal/infra/nettls"
 	"twixp/internal/infra/store"
 	"twixp/internal/ui"
@@ -26,6 +28,19 @@ import (
 // Компиляционная проверка: helix.Client реализует то, что ожидает
 // eventsub.Hub.
 var _ eventsub.SubscriptionManager = (*helix.Client)(nil)
+
+const (
+	// maxImageBytes — потолок на размер одной скачиваемой картинки.
+	maxImageBytes = 4 << 20
+	// imageCacheBytes — сколько места на диске может занимать кэш
+	// картинок; сверх этого вытесняются самые давно не использованные.
+	imageCacheBytes = 20 << 20
+	// profileRefreshInterval — как часто обновлять аватарки и имена
+	// открытых каналов, пока приложение работает (после первого
+	// обновления сразу при входе). Приложение может неделями висеть в
+	// трее, а стример за это время вполне сменит аватарку.
+	profileRefreshInterval = 12 * time.Hour
+)
 
 // TwiXP — Twitch-чат клиент для Windows XP. Composition root: собирает
 // signIn-замыкание (хранилище → авторизация → Helix → EventSub-хаб →
@@ -157,6 +172,24 @@ func main() {
 			}
 		}
 
+		// Ссылки на аватарки и имена каналов сохраняются в state.json в
+		// момент добавления и сами не обновляются — без этого шага
+		// сменившаяся у стримера аватарка так и не показалась бы. Фоном
+		// и не блокируя вход: первый показ идёт с сохранёнными данными
+		// (из дискового кэша, мгновенно), обновление подтягивается
+		// следом.
+		go func() {
+			for {
+				changed, err := workspace.RefreshProfiles(helixClient.GetChannelsByIDs)
+				if err != nil {
+					log.Println("обновить данные каналов:", err)
+				} else if changed {
+					mw.NotifyChannelsChanged()
+				}
+				time.Sleep(profileRefreshInterval)
+			}
+		}()
+
 		return ui.SignInResult{
 			Workspace:    workspace,
 			Resolve:      helixClient.GetChannelByLogin,
@@ -173,7 +206,7 @@ func main() {
 	// уже четвёртый потребитель, заново наступающий на грабли с
 	// корневыми сертификатами.
 	imageClient := nettls.NewHTTPClient(nettls.DefaultTimeout)
-	fetchImage := func(url string) (image.Image, error) {
+	downloadImage := func(url string) ([]byte, error) {
 		resp, err := imageClient.Get(url)
 		if err != nil {
 			return nil, fmt.Errorf("скачать: %v", err)
@@ -184,12 +217,22 @@ func main() {
 			return nil, fmt.Errorf("скачать: статус %d", resp.StatusCode)
 		}
 
-		img, _, err := image.Decode(resp.Body)
+		// Потолок на размер — чтобы неожиданно огромный ответ не съел
+		// память на слабой машине; настоящие аватарки/иконки на порядки
+		// меньше.
+		data, err := ioutil.ReadAll(io.LimitReader(resp.Body, maxImageBytes+1))
 		if err != nil {
-			return nil, fmt.Errorf("декодировать: %v", err)
+			return nil, fmt.Errorf("скачать: %v", err)
 		}
-		return img, nil
+		if len(data) > maxImageBytes {
+			return nil, fmt.Errorf("скачать: картинка больше %d байт", maxImageBytes)
+		}
+		return data, nil
 	}
+
+	// Дисковый кэш поверх загрузки: повторный запуск берёт картинки с
+	// диска, а не из сети (см. internal/infra/imgcache).
+	fetchImage := imgcache.New(filepath.Join(dataDir, "cache"), imageCacheBytes, downloadImage).Fetch
 
 	// loadSettings/saveSettings — обёртки над appStore.LoadSettings/
 	// SaveSettings с защитой от appStore == nil (см. выше): в отличие

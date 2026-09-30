@@ -108,6 +108,9 @@ func (s *sidebar) setWorkspace(ws *app.ChatWorkspace, resolve ChannelResolver) {
 // одинаково, потому что это одна и та же функция, а не два похожих
 // куска кода в разных местах.
 func (s *sidebar) reload() {
+	if s.workspace == nil {
+		return // вход ещё не выполнен — показывать нечего
+	}
 	channels := s.workspace.List()
 
 	live := make(map[string]bool, len(channels))
@@ -129,36 +132,100 @@ func (s *sidebar) reload() {
 	}
 }
 
-// ensureAvatar запускает загрузку аватарки канала, если её ещё нет в
-// кэше модели и она прямо сейчас не грузится. Сеть — в отдельной
-// горутине (fetchAvatar — блокирующий HTTP-запрос), применение к
-// модели — через Synchronize (см. fetchOnce в asyncfetch.go).
+// ensureAvatar запускает загрузку аватарки канала, если у модели ещё
+// нет аватарки именно по этой ссылке и она прямо сейчас не грузится.
+// Сравнение по ССЫЛКЕ, а не просто "есть ли какая-то аватарка":
+// стример мог сменить аватарку, и refreshChannels принесёт новый
+// AvatarURL — тогда нужно загрузить новую, а не считать вопрос
+// закрытым. Пока грузится новая, старая остаётся на экране.
+//
+// Сеть — в отдельной горутине (fetchAvatar — блокирующий HTTP-запрос
+// либо чтение дискового кэша), применение к модели — через
+// Synchronize (см. fetchOnce в asyncfetch.go).
 func (s *sidebar) ensureAvatar(channel domain.Channel) {
-	if channel.AvatarURL == "" || s.fetchAvatar == nil || s.model.hasAvatar(channel.ID) {
+	if channel.AvatarURL == "" || s.fetchAvatar == nil || s.model.avatarURL(channel.ID) == channel.AvatarURL {
 		return
 	}
 
-	fetchOnce(s.window, s.avatarsInFlight, channel.ID,
+	url := channel.AvatarURL
+
+	// Ключ pending включает ссылку: загрузка старой ссылки не должна
+	// мешать запуску загрузки новой.
+	fetchOnce(s.window, s.avatarsInFlight, channel.ID+"|"+url,
 		fmt.Sprintf("аватар канала %s:", channel.Name),
 		func() (apply func(), err error) {
-			img, err := s.fetchAvatar(channel.AvatarURL)
+			img, err := s.fetchAvatar(url)
 			if err != nil {
 				return nil, err
 			}
 
 			// toSidebarIcon — это в итоге walk.NewBitmapFromImage, GDI-
-			// вызов: как и в оригинале до рефакторинга, оставляем его
-			// внутри apply (UI-поток, вызывается уже после Synchronize
-			// в fetchOnce), а не здесь, в фоновой горутине.
+			// вызов: оставляем его внутри apply (UI-поток, вызывается
+			// уже после Synchronize в fetchOnce), а не здесь, в
+			// фоновой горутине.
 			return func() {
+				// Пока грузилось, канал могли закрыть или его ссылка
+				// сменилась ещё раз — не затираем актуальное старым.
+				if s.currentAvatarURL(channel.ID) != url {
+					return
+				}
 				icon, err := toSidebarIcon(img)
 				if err != nil {
 					log.Printf("аватар канала %s: %v", channel.Name, err)
 					return
 				}
-				s.model.setAvatar(channel.ID, icon)
+				s.model.setAvatar(channel.ID, url, icon)
 			}, nil
 		})
+}
+
+// currentAvatarURL — актуальная ссылка на аватарку канала по ID из
+// текущего списка (пустая строка, если канала в списке уже нет).
+func (s *sidebar) currentAvatarURL(channelID string) string {
+	for _, ch := range s.channelOrder {
+		if ch.ID == channelID {
+			return ch.AvatarURL
+		}
+	}
+	return ""
+}
+
+// refreshChannels применяет обновлённые данные каналов (аватарка,
+// имя — см. app.ChatWorkspace.RefreshProfiles), не трогая состав
+// списка. Если состав или порядок не изменился — обновляем модель на
+// месте, БЕЗ полного сброса строк (setChannels → PublishRowsReset
+// мог бы сбросить выделение, которое пользователь успел сделать), и
+// запускаем догрузку аватарок с новыми ссылками. Если состав всё же
+// поменялся (канал закрыли параллельно) — обычный reload.
+func (s *sidebar) refreshChannels() {
+	if s.workspace == nil {
+		return
+	}
+
+	channels := s.workspace.List()
+	if !sameChannelIDs(channels, s.channelOrder) {
+		s.reload()
+		return
+	}
+
+	s.channelOrder = channels
+	s.model.updateChannels(channels)
+
+	for _, ch := range channels {
+		s.ensureAvatar(ch)
+	}
+}
+
+func sameChannelIDs(a, b []domain.Channel) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].ID != b[i].ID {
+			return false
+		}
+	}
+	return true
 }
 
 // selectChannel выделяет канал в списке по ID и делает его активным.
@@ -400,6 +467,10 @@ type channelListModel struct {
 
 	channels []domain.Channel
 	avatars  map[string]*walk.Bitmap // по Channel.ID; отсутствие в карте = ещё не загружена
+	// avatarURLs — по какой ссылке загружена картинка из avatars (тот
+	// же ключ). Нужна, чтобы заметить смену аватарки у стримера: если
+	// AvatarURL канала стал другим, картинку надо загрузить заново.
+	avatarURLs map[string]string
 
 	// showAvatars — переключатель из настроек (см. domain.Settings).
 	// true по умолчанию (newChannelListModel) — так модель ведёт себя
@@ -409,7 +480,11 @@ type channelListModel struct {
 }
 
 func newChannelListModel() *channelListModel {
-	return &channelListModel{avatars: make(map[string]*walk.Bitmap), showAvatars: true}
+	return &channelListModel{
+		avatars:     make(map[string]*walk.Bitmap),
+		avatarURLs:  make(map[string]string),
+		showAvatars: true,
+	}
 }
 
 func (m *channelListModel) RowCount() int {
@@ -466,19 +541,33 @@ func (m *channelListModel) setChannels(channels []domain.Channel) {
 	for id := range m.avatars {
 		if !live[id] {
 			delete(m.avatars, id)
+			delete(m.avatarURLs, id)
 		}
 	}
 
 	m.PublishRowsReset()
 }
 
-func (m *channelListModel) hasAvatar(channelID string) bool {
-	_, ok := m.avatars[channelID]
-	return ok
+// updateChannels подменяет данные каналов на месте — тот же набор и
+// порядок, что уже в модели (это вызывающий код проверяет сам, см.
+// sidebar.refreshChannels), — и просит перерисовать строки без
+// PublishRowsReset, чтобы не сбросить выделение.
+func (m *channelListModel) updateChannels(channels []domain.Channel) {
+	m.channels = channels
+	for row := range channels {
+		m.PublishRowChanged(row)
+	}
 }
 
-func (m *channelListModel) setAvatar(channelID string, bmp *walk.Bitmap) {
+// avatarURL — ссылка, по которой загружена текущая аватарка канала
+// (пустая строка, если аватарка ещё не загружена).
+func (m *channelListModel) avatarURL(channelID string) string {
+	return m.avatarURLs[channelID]
+}
+
+func (m *channelListModel) setAvatar(channelID, url string, bmp *walk.Bitmap) {
 	m.avatars[channelID] = bmp
+	m.avatarURLs[channelID] = url
 	for row, ch := range m.channels {
 		if ch.ID == channelID {
 			m.PublishRowChanged(row)
