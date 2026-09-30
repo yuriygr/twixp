@@ -13,6 +13,7 @@ import (
 
 	"twixp/internal/app"
 	"twixp/internal/domain"
+	"twixp/internal/infra/appdir"
 	"twixp/internal/infra/applog"
 	"twixp/internal/infra/auth"
 	"twixp/internal/infra/eventsub"
@@ -38,11 +39,20 @@ var _ eventsub.SubscriptionManager = (*helix.Client)(nil)
 // уходят в лог-файл (applog.Open) и всплывают в статус-баре уже
 // изнутри ui.MainWindow, когда signIn однажды будет вызван.
 func main() {
-	if f := applog.Open("./data"); f != nil {
+	// Данные живут в профиле пользователя (%APPDATA%\TwiXP), а не рядом
+	// с exe: так они переживают переезд/обновление папки с программой,
+	// не лежат в каталоге, куда обычному пользователю может быть
+	// запрещена запись, и у каждого пользователя машины свои.
+	dataDir := appdir.Dir()
+
+	if f := applog.Open(dataDir); f != nil {
 		defer f.Close()
 	}
 
-	appStore, err := store.New("./data")
+	// Старый data рядом с exe (LegacyDirs) — источник одноразовой
+	// миграции: store.New сам перенесёт оттуда данные, зашифрует токен
+	// и удалит старый файл с открытым токеном.
+	appStore, err := store.New(dataDir, appdir.LegacyDirs()...)
 	if err != nil {
 		log.Println("открыть хранилище:", err)
 		// appStore остаётся nil — signIn ниже сразу вернёт понятную

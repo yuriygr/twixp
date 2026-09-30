@@ -2,7 +2,9 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,59 +20,259 @@ import (
 // не трогает файлы на диске напрямую — это единственный пакет, который
 // знает про физическую разметку директории данных.
 //
-// Небольшие, часто читаемые данные (настройки, токен, список каналов)
-// живут в одном файле state.json — при их размере дёшево читать и
-// перезаписывать целиком на каждое изменение.
+// Разметка директории (см. appdir.Dir — %APPDATA%\TwiXP):
+//
+//	state.json — настройки и список каналов. Не секрет, поэтому
+//	             обычный читаемый JSON: его можно и посмотреть, и
+//	             поправить руками.
+//	token.bin  — OAuth-токен (access + refresh), зашифрованный
+//	             Windows DPAPI под текущего пользователя. Единственное
+//	             по-настоящему секретное, что мы храним: refresh-токен
+//	             даёт доступ к аккаунту надолго, поэтому в открытом
+//	             виде на диске он не лежит.
 //
 // Более тяжёлые данные (история сообщений по каждому каналу,
-// потенциально большая и растущая) НЕ должны попадать в тот же
-// state.json — когда до них дойдёт очередь, им место в отдельных
-// файлах внутри этой же директории (например, history/<channel_id>.json),
-// подгружаемых по требованию, а не все разом при каждом старте.
-// Именно поэтому Store работает с директорией (Dir), а не с одним
-// файлом — организационная граница уже заложена.
+// потенциально большая и растущая) НЕ должны попадать в state.json —
+// когда до них дойдёт очередь, им место в отдельных файлах внутри
+// этой же директории, подгружаемых по требованию. Именно поэтому Store
+// работает с директорией (Dir), а не с одним файлом.
 type Store struct {
 	dir string
 
 	mu    sync.Mutex
 	state state
+	token *domain.Token
+
+	// plaintextLeft — после загрузки в state.json всё ещё лежит токен в
+	// открытом виде (не удалось зашифровать или перезаписать файл).
+	// Пока флаг стоит, старый источник миграции не удаляется.
+	plaintextLeft bool
 }
 
 // state — то, что реально лежит в state.json.
 type state struct {
+	// Token — ТОЛЬКО для чтения старых файлов: до появления token.bin
+	// токен хранился здесь открытым текстом. Новые версии его сюда
+	// никогда не пишут; найденный при загрузке токен переезжает в
+	// token.bin, а поле обнуляется (см. adoptLegacyTokenLocked).
 	Token    *domain.Token    `json:"token,omitempty"`
 	Channels []domain.Channel `json:"channels,omitempty"`
 	Settings *domain.Settings `json:"settings,omitempty"`
 }
 
+// tokenMagic — первые байты token.bin: версия формата. Даёт возможность
+// однажды сменить схему шифрования и отличить старые файлы от новых.
+var tokenMagic = []byte("TXP1")
+
+// tokenEntropy — дополнительная "соль" для DPAPI, привязывающая блоб к
+// нашему приложению: другая программа того же пользователя не
+// расшифрует его простым вызовом CryptUnprotectData без знания этой
+// константы. Это не криптографический секрет (она есть в бинарнике), а
+// разделение по приложениям.
+var tokenEntropy = []byte("TwiXP/token/v1")
+
 // New создаёт Store поверх директории dir (создаётся при первом
-// сохранении, если ещё не существует) и сразу читает существующий
-// state.json, если он есть. Отсутствие файла — не ошибка, нормальный
-// случай для первого запуска.
-func New(dir string) (*Store, error) {
+// сохранении, если ещё не существует) и сразу читает существующие
+// данные. Отсутствие файлов — не ошибка, нормальный случай для первого
+// запуска.
+//
+// legacyDirs — каталоги, где старые версии хранили данные (data рядом с
+// exe). Если в dir ещё нет ни state.json, ни token.bin, а в одном из
+// legacyDirs есть старый state.json — выполняется одноразовая
+// миграция: файл копируется в dir, токен из него уходит в
+// зашифрованный token.bin, а старый файл с открытым токеном
+// удаляется. Миграция никогда не перезаписывает существующие данные
+// в dir.
+func New(dir string, legacyDirs ...string) (*Store, error) {
 	s := &Store{dir: dir}
+
+	migratedFrom := s.importLegacy(legacyDirs)
 
 	if err := s.load(); err != nil {
 		return nil, err
 	}
 
+	if migratedFrom != "" {
+		if s.plaintextLeft {
+			log.Printf("миграция: токен в %s остался в открытом виде, старый файл не удалён", migratedFrom)
+		} else if err := os.Remove(migratedFrom); err != nil {
+			log.Printf("миграция: удалить старый %s: %v", migratedFrom, err)
+		} else {
+			log.Printf("миграция: данные перенесены из %s в %s", migratedFrom, dir)
+			// Пустой каталог убираем за собой; если в нём ещё что-то
+			// лежит (например, старый лог) — Remove просто откажет.
+			os.Remove(filepath.Dir(migratedFrom))
+		}
+	}
+
 	return s, nil
 }
 
-func (s *Store) statePath() string {
-	return filepath.Join(s.dir, "state.json")
+func (s *Store) statePath() string { return filepath.Join(s.dir, "state.json") }
+func (s *Store) tokenPath() string { return filepath.Join(s.dir, "token.bin") }
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// importLegacy копирует старый state.json в новый каталог, если
+// миграция нужна (см. New). Возвращает путь к скопированному
+// источнику либо "" — если мигрировать нечего или не получилось
+// (тогда просто стартуем с пустого состояния, ошибка уходит в лог).
+func (s *Store) importLegacy(legacyDirs []string) string {
+	if exists(s.statePath()) || exists(s.tokenPath()) {
+		return ""
+	}
+
+	for _, ld := range legacyDirs {
+		if sameDir(ld, s.dir) {
+			continue
+		}
+
+		src := filepath.Join(ld, "state.json")
+		data, err := ioutil.ReadFile(src)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("миграция: прочитать %s: %v", src, err)
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(s.dir, 0700); err != nil {
+			log.Printf("миграция: создать %s: %v", s.dir, err)
+			return ""
+		}
+		if err := writeFileAtomic(s.statePath(), data, 0600); err != nil {
+			log.Printf("миграция: записать %s: %v", s.statePath(), err)
+			return ""
+		}
+		return src
+	}
+	return ""
+}
+
+func sameDir(a, b string) bool {
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	return errA == nil && errB == nil && absA == absB
 }
 
 func (s *Store) load() error {
 	data, err := ioutil.ReadFile(s.statePath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(data, &s.state); err != nil {
+			return err
 		}
+	case !os.IsNotExist(err):
 		return err
 	}
 
-	return json.Unmarshal(data, &s.state)
+	s.token = s.readTokenFile()
+
+	if s.state.Token != nil {
+		s.mu.Lock()
+		if err := s.adoptLegacyTokenLocked(); err != nil {
+			log.Println("перенести токен из state.json в token.bin:", err)
+			s.plaintextLeft = true
+		}
+		s.mu.Unlock()
+	}
+
+	return nil
+}
+
+// readTokenFile читает и расшифровывает token.bin. Любой сбой (нет
+// файла, повреждён, расшифровать нельзя — например, сменили пароль
+// учётной записи админом или файл скопирован с другой машины) означает
+// просто "токена нет": приложение попросит войти заново, что и есть
+// правильная реакция. Ошибка, кроме "нет файла", уходит в лог.
+func (s *Store) readTokenFile() *domain.Token {
+	raw, err := ioutil.ReadFile(s.tokenPath())
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Println("прочитать token.bin:", err)
+		}
+		return nil
+	}
+
+	if len(raw) < len(tokenMagic) || string(raw[:len(tokenMagic)]) != string(tokenMagic) {
+		log.Println("token.bin: неизвестный формат, токен проигнорирован")
+		return nil
+	}
+
+	plain, err := unprotect(raw[len(tokenMagic):], tokenEntropy)
+	if err != nil {
+		log.Println("token.bin: не удалось расшифровать, потребуется новый вход:", err)
+		return nil
+	}
+
+	var token domain.Token
+	if err := json.Unmarshal(plain, &token); err != nil {
+		log.Println("token.bin: повреждённое содержимое:", err)
+		return nil
+	}
+	return &token
+}
+
+// adoptLegacyTokenLocked переносит токен, найденный в state.json в
+// открытом виде (старый формат), в token.bin и перезаписывает
+// state.json уже без него. Порядок важен: сначала гарантированно
+// сохраняем зашифрованную копию, и только потом стираем открытую —
+// иначе сбой посередине потерял бы токен.
+func (s *Store) adoptLegacyTokenLocked() error {
+	legacy := s.state.Token
+
+	if s.token == nil {
+		s.token = legacy
+		if err := s.saveTokenLocked(); err != nil {
+			// Шифрование не удалось — токен остаётся в памяти (сеанс
+			// работает), а файл со старым содержимым не трогаем.
+			s.state.Token = legacy
+			return err
+		}
+	}
+
+	s.state.Token = nil
+	if err := s.saveStateLocked(); err != nil {
+		s.state.Token = legacy
+		return err
+	}
+	return nil
+}
+
+// writeFileAtomic пишет во временный файл рядом и переименовывает его
+// поверх целевого: обрыв питания или падение посередине записи не
+// оставит наполовину записанный (а значит нечитаемый) state.json или
+// token.bin — останется либо старая версия, либо новая целиком.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // saveStateLocked пишет state.json целиком. Вызывающий код должен уже
@@ -85,7 +287,31 @@ func (s *Store) saveStateLocked() error {
 		return err
 	}
 
-	return ioutil.WriteFile(s.statePath(), data, 0600)
+	return writeFileAtomic(s.statePath(), data, 0600)
+}
+
+// saveTokenLocked шифрует s.token через DPAPI и пишет token.bin.
+// Вызывающий код должен уже держать s.mu.
+func (s *Store) saveTokenLocked() error {
+	if s.token == nil {
+		return errors.New("нечего сохранять: токена нет")
+	}
+
+	if err := os.MkdirAll(s.dir, 0700); err != nil {
+		return err
+	}
+
+	plain, err := json.Marshal(s.token)
+	if err != nil {
+		return err
+	}
+
+	blob, err := protect(plain, tokenEntropy)
+	if err != nil {
+		return err
+	}
+
+	return writeFileAtomic(s.tokenPath(), append(append([]byte{}, tokenMagic...), blob...), 0600)
 }
 
 // ---------------------------------------------------------------
@@ -98,28 +324,34 @@ func (s *Store) LoadToken() (domain.Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.state.Token == nil {
+	if s.token == nil {
 		return domain.Token{}, app.ErrNoToken
 	}
-	return *s.state.Token, nil
+	return *s.token, nil
 }
 
-// SaveToken сохраняет токен.
+// SaveToken сохраняет токен в зашифрованном виде. Если шифрование или
+// запись не удались, токен всё равно остаётся в памяти на время сеанса
+// (см. комментарий в AuthService.EnsureAuthenticated), а ошибка
+// возвращается вызывающему.
 func (s *Store) SaveToken(token domain.Token) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.state.Token = &token
-	return s.saveStateLocked()
+	s.token = &token
+	return s.saveTokenLocked()
 }
 
-// ClearToken удаляет сохранённый токен.
+// ClearToken удаляет сохранённый токен — и из памяти, и с диска.
 func (s *Store) ClearToken() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.state.Token = nil
-	return s.saveStateLocked()
+	s.token = nil
+	if err := os.Remove(s.tokenPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------
