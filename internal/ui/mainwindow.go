@@ -56,6 +56,12 @@ type ChannelResolver func(login string) (domain.Channel, error)
 // отрисована, к загрузке отношения не имеет.
 type ImageFetcher func(url string) (image.Image, error)
 
+// ProfileFetcher возвращает публичный профиль пользователя Twitch по ID
+// — для окна "Профиль пользователя" (см. helix.Client.GetUserProfile).
+// Блокирующий сетевой вызов: окно профиля дёргает его из фоновой
+// горутины.
+type ProfileFetcher func(userID string) (domain.UserProfile, error)
+
 // BadgeCatalog возвращает каталог бейджей САМОГО канала — какой URL
 // картинки соответствует каждой паре (set_id, id) бейджа, приходящей в
 // domain.ChatMessage.Badges (см. eventsub/message.go). То же самое, что
@@ -101,6 +107,9 @@ type SignInResult struct {
 	// один раз за сессию, не дожидаясь первого сообщения с бейджем (см.
 	// chatPane.setGlobalBadgeCatalog).
 	GlobalBadges GlobalBadgeCatalog
+	// Profile — источник профилей пользователей для окна "Профиль
+	// пользователя" (см. ProfileFetcher).
+	Profile ProfileFetcher
 }
 
 // SignIn выполняет вход целиком: авторизацию и разворачивание рабочей
@@ -573,6 +582,7 @@ func (m *MainWindow) applySignIn(result SignInResult) {
 	m.chatPane.setViewer(result.Viewer)
 	m.chatPane.setBadgeCatalog(result.Badges)
 	m.chatPane.setGlobalBadgeCatalog(result.GlobalBadges)
+	m.chatPane.setProfileFetcher(result.Profile)
 
 	m.setStatus("")
 	m.sidebar.reload()

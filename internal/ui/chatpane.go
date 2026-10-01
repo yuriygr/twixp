@@ -104,6 +104,12 @@ type chatPane struct {
 	// по URL" (см. ui.ImageFetcher), здесь используется только для
 	// иконок бейджей (см. resolveBadge/ensureBadgeIcon).
 	fetchIcon ImageFetcher
+
+	// fetchProfile — способ получить публичный профиль пользователя по
+	// ID (см. ProfileFetcher); выставляется после входа
+	// (setProfileFetcher), до того пункт "Профиль пользователя" в меню
+	// просто ничего не открывает.
+	fetchProfile ProfileFetcher
 	// badgeCatalog — способ узнать URL картинки бейджа для конкретного
 	// канала (см. ui.BadgeCatalog). nil, пока не выполнен успешный вход
 	// (см. setBadgeCatalog) — ensureBadgeCatalog в этом случае просто
@@ -212,7 +218,7 @@ func newChatPane(status statusReporter, fetchIcon ImageFetcher) *chatPane {
 		mentionStart:        -1,
 		mentionAutocomplete: true,
 	}
-	p.view = newChatView(p.startReply, p.resolveBadge)
+	p.view = newChatView(p.startReply, p.openProfile, p.resolveBadge)
 	return p
 }
 
@@ -273,6 +279,30 @@ func (p *chatPane) Shutdown() {
 // подсветки сообщений с упоминанием (см. isMentioned/appendMessage).
 func (p *chatPane) setViewer(viewer domain.User) {
 	p.viewer = viewer
+}
+
+// setProfileFetcher сообщает, откуда брать профили пользователей для
+// окна "Профиль пользователя" — вызывается после входа, когда появляется
+// Helix-клиент.
+func (p *chatPane) setProfileFetcher(fetch ProfileFetcher) {
+	p.fetchProfile = fetch
+}
+
+// openProfile открывает окно профиля автора строки (пункт "Профиль
+// пользователя" контекстного меню). Иконки бейджей берутся из
+// каталога показанного сейчас канала — а именно из него и кликнули по
+// сообщению.
+func (p *chatPane) openProfile(line chatLine) {
+	if p.fetchProfile == nil || line.AuthorID == "" {
+		return
+	}
+
+	showProfileDialog(p.window, profileDialogData{
+		line:         line,
+		resolveBadge: p.resolveBadge,
+		fetchProfile: p.fetchProfile,
+		fetchImage:   p.fetchIcon,
+	})
 }
 
 // setBadgeCatalog подключает способ узнавать бейджи канала сразу после
@@ -584,6 +614,8 @@ func (p *chatPane) appendMessage(channelID string, msg domain.ChatMessage) {
 	line := chatLine{
 		Time:          msg.SentAt,
 		Author:        msg.Author.DisplayName,
+		AuthorID:      msg.Author.ID,
+		AuthorLogin:   msg.Author.Login,
 		MessageID:     msg.ID,
 		Color:         walk.RGB(nc.R, nc.G, nc.B),
 		Text:          domain.StripReplyMentionPrefix(msg.Text, msg.ReplyTo),

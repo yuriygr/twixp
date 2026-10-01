@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"twixp/internal/app"
 	"twixp/internal/domain"
@@ -55,13 +56,19 @@ func NewClient(clientID string, token TokenProvider) *Client {
 	}
 }
 
+// userDTO — один пользователь в ответе Get Users (только нужные поля).
+type userDTO struct {
+	ID              string `json:"id"`
+	Login           string `json:"login"`
+	DisplayName     string `json:"display_name"`
+	ProfileImageURL string `json:"profile_image_url"`
+	Description     string `json:"description"`
+	BroadcasterType string `json:"broadcaster_type"`
+	CreatedAt       string `json:"created_at"`
+}
+
 type usersResponse struct {
-	Data []struct {
-		ID              string `json:"id"`
-		Login           string `json:"login"`
-		DisplayName     string `json:"display_name"`
-		ProfileImageURL string `json:"profile_image_url"`
-	} `json:"data"`
+	Data []userDTO `json:"data"`
 }
 
 type apiError struct {
@@ -94,10 +101,10 @@ func (c *Client) getUser(query url.Values) (domain.User, error) {
 	return users[0], nil
 }
 
-// getUsers — общая часть Get Users: возвращает всех найденных
+// fetchUsers — общая часть Get Users: возвращает всех найденных
 // пользователей (может быть меньше запрошенных — например, если
 // аккаунт удалён или заблокирован; пустой результат — не ошибка).
-func (c *Client) getUsers(query url.Values) ([]domain.User, error) {
+func (c *Client) fetchUsers(query url.Values) ([]userDTO, error) {
 	resp, err := c.do("GET", "/users", query, nil)
 	if err != nil {
 		return nil, err
@@ -112,9 +119,18 @@ func (c *Client) getUsers(query url.Values) ([]domain.User, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
+	return out.Data, nil
+}
 
-	users := make([]domain.User, 0, len(out.Data))
-	for _, u := range out.Data {
+// getUsers — fetchUsers, сведённый к минимуму, нужному чату (domain.User).
+func (c *Client) getUsers(query url.Values) ([]domain.User, error) {
+	dtos, err := c.fetchUsers(query)
+	if err != nil {
+		return nil, err
+	}
+
+	users := make([]domain.User, 0, len(dtos))
+	for _, u := range dtos {
 		users = append(users, domain.User{
 			ID:          u.ID,
 			Login:       u.Login,
@@ -123,6 +139,35 @@ func (c *Client) getUsers(query url.Values) ([]domain.User, error) {
 		})
 	}
 	return users, nil
+}
+
+// GetUserProfile возвращает публичный профиль пользователя по ID — для
+// окна "Профиль пользователя". По ID, а не по логину: ID есть в каждом
+// сообщении и не меняется, а логин может смениться. Права не нужны.
+func (c *Client) GetUserProfile(userID string) (domain.UserProfile, error) {
+	dtos, err := c.fetchUsers(url.Values{"id": {userID}})
+	if err != nil {
+		return domain.UserProfile{}, err
+	}
+	if len(dtos) == 0 {
+		return domain.UserProfile{}, fmt.Errorf("пользователь не найден")
+	}
+
+	u := dtos[0]
+	profile := domain.UserProfile{
+		ID:              u.ID,
+		Login:           u.Login,
+		DisplayName:     u.DisplayName,
+		AvatarURL:       u.ProfileImageURL,
+		Description:     u.Description,
+		BroadcasterType: u.BroadcasterType,
+	}
+	// Дата — "2016-12-14T20:32:28Z". Не разобралась — оставляем нулевой,
+	// окно просто не покажет строку про возраст аккаунта.
+	if t, err := time.Parse(time.RFC3339, u.CreatedAt); err == nil {
+		profile.CreatedAt = t
+	}
+	return profile, nil
 }
 
 // maxUsersPerRequest — сколько id Twitch принимает в одном Get Users.

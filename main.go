@@ -196,6 +196,7 @@ func main() {
 			Viewer:       me,
 			Badges:       helixClient.ChannelBadges,
 			GlobalBadges: helixClient.GlobalBadges,
+			Profile:      helixClient.GetUserProfile,
 		}, nil
 	}
 

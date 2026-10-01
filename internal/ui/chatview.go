@@ -26,11 +26,18 @@ import (
 // показанные строки подхватывают иконку, догрузившуюся позже (см.
 // chatPane.resolveBadge/ensureBadgeIcon).
 type chatLine struct {
-	Time      time.Time
-	Author    string
-	MessageID string // ID сообщения в Twitch — нужен для reply_parent_message_id
-	Color     walk.Color
-	Text      string
+	Time   time.Time
+	Author string
+	// AuthorID/AuthorLogin — кто написал: нужны окну "Профиль
+	// пользователя" (по ID запрашивается профиль, по логину строится
+	// ссылка на канал). Author — отображаемое имя, которого для этого
+	// мало (оно может быть на кириллице и не совпадать с логином). У
+	// системных уведомлений пусты.
+	AuthorID    string
+	AuthorLogin string
+	MessageID   string // ID сообщения в Twitch — нужен для reply_parent_message_id
+	Color       walk.Color
+	Text        string
 	// Badges — бейджи автора на момент отправки сообщения (модератор,
 	// подписчик, VIP и т.п.), в том порядке, в каком их прислал Twitch.
 	Badges []domain.Badge
@@ -250,6 +257,14 @@ type chatView struct {
 	// решает chatPane (переключает состояние поля ввода).
 	onReply func(chatLine)
 
+	// onProfile вызывается по клику "Профиль пользователя" в контекстном
+	// меню, с той же строкой contextLine, что и onReply. profileAction —
+	// сам пункт меню: включается и выключается при каждом правом клике
+	// (см. onMouseDown) — у системных уведомлений нет автора, и пункт
+	// на них серый.
+	onProfile     func(chatLine)
+	profileAction *walk.Action
+
 	// resolveBadge отдаёт иконку бейджа для отрисовки, если она уже
 	// скачана (см. chatPane.resolveBadge) — сама загрузка, если нужна,
 	// вне ответственности chatView, только эта отдача готового
@@ -305,9 +320,10 @@ type chatView struct {
 	fontSize int
 }
 
-func newChatView(onReply func(chatLine), resolveBadge func(domain.Badge) *walk.Bitmap) *chatView {
+func newChatView(onReply, onProfile func(chatLine), resolveBadge func(domain.Badge) *walk.Bitmap) *chatView {
 	return &chatView{
 		onReply:      onReply,
+		onProfile:    onProfile,
 		resolveBadge: resolveBadge,
 		// Значения по умолчанию — как будто настроек ещё не подвезли
 		// (см. комментарий у полей): applySettings перезапишет их
@@ -417,6 +433,16 @@ func (v *chatView) attach(widget *walk.CustomWidget) {
 		})
 		_ = menu.Actions().Add(reply)
 
+		profile := walk.NewAction()
+		_ = profile.SetText("Профиль пользователя")
+		profile.Triggered().Attach(func() {
+			if v.hasContext && v.onProfile != nil && canShowProfile(v.contextLine) {
+				v.onProfile(v.contextLine)
+			}
+		})
+		_ = menu.Actions().Add(profile)
+		v.profileAction = profile
+
 		copyMsg := walk.NewAction()
 		_ = copyMsg.SetText("Скопировать сообщение")
 		copyMsg.Triggered().Attach(func() {
@@ -467,6 +493,19 @@ func (v *chatView) onMouseDown(x, y int, button walk.MouseButton) {
 	line, ok := v.lineAt(y)
 	v.contextLine = line
 	v.hasContext = ok
+
+	// Контекстное меню покажется уже после этого (WM_CONTEXTMENU идёт
+	// после отпускания кнопки), так что состояние пункта успеет
+	// обновиться.
+	if v.profileAction != nil {
+		_ = v.profileAction.SetEnabled(ok && canShowProfile(line))
+	}
+}
+
+// canShowProfile — есть ли у строки автор, чей профиль можно открыть:
+// обычное сообщение пользователя, а не системное уведомление.
+func canShowProfile(line chatLine) bool {
+	return line.SystemMessage == "" && line.AuthorID != ""
 }
 
 // visualRow — видимая "строка" (блок одного сообщения) в текущих
