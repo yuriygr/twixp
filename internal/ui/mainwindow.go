@@ -62,6 +62,12 @@ type ImageFetcher func(url string) (image.Image, error)
 // горутины.
 type ProfileFetcher func(userID string) (domain.UserProfile, error)
 
+// FollowedFetcher возвращает каналы из подписок пользователя с отметкой,
+// кто в эфире (см. helix.Client.GetFollowedChannels) — для списка в
+// диалоге "Добавить канал". Блокирующий сетевой вызов: диалог дёргает его
+// из фоновой горутины.
+type FollowedFetcher func(userID string) ([]domain.FollowedChannel, error)
+
 // BadgeCatalog возвращает каталог бейджей САМОГО канала — какой URL
 // картинки соответствует каждой паре (set_id, id) бейджа, приходящей в
 // domain.ChatMessage.Badges (см. eventsub/message.go). То же самое, что
@@ -110,6 +116,9 @@ type SignInResult struct {
 	// Profile — источник профилей пользователей для окна "Профиль
 	// пользователя" (см. ProfileFetcher).
 	Profile ProfileFetcher
+	// Followed — источник подписок пользователя для диалога "Добавить
+	// канал" (см. FollowedFetcher).
+	Followed FollowedFetcher
 }
 
 // SignIn выполняет вход целиком: авторизацию и разворачивание рабочей
@@ -578,6 +587,7 @@ func (m *MainWindow) applySignIn(result SignInResult) {
 	}
 
 	m.sidebar.setWorkspace(result.Workspace, result.Resolve)
+	m.sidebar.setFollowed(result.Followed, result.Viewer.ID)
 	m.chatPane.setWorkspace(result.Workspace)
 	m.chatPane.setViewer(result.Viewer)
 	m.chatPane.setBadgeCatalog(result.Badges)

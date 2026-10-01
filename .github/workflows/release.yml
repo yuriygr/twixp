@@ -36,6 +36,7 @@ jobs:
         # config.go не хранится в репозитории (см. .gitignore) — тот
         # же Client ID, что при обычной локальной сборке, только
         # взятый из GitHub Secret, а не из личного файла разработчика.
+        # Список scopes должен совпадать с config.go.example.
         run: |
           cat > config.go <<GOEOF
           //go:build windows
@@ -45,7 +46,7 @@ jobs:
 
           const clientID = "${{ secrets.TWITCH_CLIENT_ID }}"
 
-          var scopes = []string{"user:read:chat", "user:write:chat"}
+          var scopes = []string{"user:read:chat", "user:write:chat", "user:read:follows", "user:manage:blocked_users"}
           GOEOF
 
       - name: make build

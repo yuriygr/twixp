@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -168,6 +169,150 @@ func (c *Client) GetUserProfile(userID string) (domain.UserProfile, error) {
 		profile.CreatedAt = t
 	}
 	return profile, nil
+}
+
+// Лимиты на листание списков подписок: на всякий случай не ходить за
+// бесконечно длинным списком. 5 страниц по 100 — 500 каналов, больше
+// людей почти не держит в подписках; не поместившееся в список просто не
+// предлагается (канал всё равно можно добавить, введя логин руками).
+const (
+	followedPageSize        = 100
+	maxFollowedPages        = 5
+	maxFollowedStreamsPages = 3
+)
+
+type followedChannelsResponse struct {
+	Data []struct {
+		BroadcasterID    string `json:"broadcaster_id"`
+		BroadcasterLogin string `json:"broadcaster_login"`
+		BroadcasterName  string `json:"broadcaster_name"`
+	} `json:"data"`
+	Pagination struct {
+		Cursor string `json:"cursor"`
+	} `json:"pagination"`
+}
+
+type followedStreamsResponse struct {
+	Data []struct {
+		UserID      string `json:"user_id"`
+		UserLogin   string `json:"user_login"`
+		UserName    string `json:"user_name"`
+		GameName    string `json:"game_name"`
+		Type        string `json:"type"`
+		ViewerCount int    `json:"viewer_count"`
+	} `json:"data"`
+	Pagination struct {
+		Cursor string `json:"cursor"`
+	} `json:"pagination"`
+}
+
+// getJSON — GET с разбором JSON-ответа в out; не-200 превращается в
+// ошибку API (decodeAPIError).
+func (c *Client) getJSON(path string, query url.Values, out interface{}) error {
+	resp, err := c.do("GET", path, query, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return decodeAPIError(resp)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// fetchFollowedChannels листает Get Followed Channels (scope
+// user:read:follows): каналы, на которые подписан пользователь.
+func (c *Client) fetchFollowedChannels(userID string) ([]domain.Channel, error) {
+	var channels []domain.Channel
+	cursor := ""
+
+	for page := 0; page < maxFollowedPages; page++ {
+		query := url.Values{"user_id": {userID}, "first": {fmt.Sprint(followedPageSize)}}
+		if cursor != "" {
+			query.Set("after", cursor)
+		}
+
+		var out followedChannelsResponse
+		if err := c.getJSON("/channels/followed", query, &out); err != nil {
+			return nil, err
+		}
+		for _, d := range out.Data {
+			channels = append(channels, domain.Channel{
+				ID:          d.BroadcasterID,
+				Name:        d.BroadcasterLogin,
+				DisplayName: d.BroadcasterName,
+			})
+		}
+
+		cursor = out.Pagination.Cursor
+		if cursor == "" || len(out.Data) == 0 {
+			break
+		}
+	}
+	return channels, nil
+}
+
+// fetchFollowedStreams листает Get Followed Streams: у кого из подписок
+// сейчас идёт эфир. user_id по правилам Twitch должен совпадать с
+// пользователем токена — сюда всегда передаётся ID вошедшего.
+func (c *Client) fetchFollowedStreams(userID string) ([]domain.LiveStream, error) {
+	var streams []domain.LiveStream
+	cursor := ""
+
+	for page := 0; page < maxFollowedStreamsPages; page++ {
+		query := url.Values{"user_id": {userID}, "first": {fmt.Sprint(followedPageSize)}}
+		if cursor != "" {
+			query.Set("after", cursor)
+		}
+
+		var out followedStreamsResponse
+		if err := c.getJSON("/streams/followed", query, &out); err != nil {
+			return nil, err
+		}
+		for _, d := range out.Data {
+			if d.Type != "" && d.Type != "live" {
+				continue
+			}
+			streams = append(streams, domain.LiveStream{
+				UserID:      d.UserID,
+				Login:       d.UserLogin,
+				DisplayName: d.UserName,
+				Game:        d.GameName,
+				Viewers:     d.ViewerCount,
+			})
+		}
+
+		cursor = out.Pagination.Cursor
+		if cursor == "" || len(out.Data) == 0 {
+			break
+		}
+	}
+	return streams, nil
+}
+
+// GetFollowedChannels возвращает каналы из подписок пользователя с
+// отметкой, у кого сейчас идёт эфир (см. domain.MergeFollowed) — для
+// списка в диалоге "Добавить канал". Нужен scope user:read:follows;
+// без него Twitch ответит ошибкой, и вызывающий код покажет, что
+// подписки недоступны.
+//
+// Подписки — обязательная часть, а эфиры — украшение: если запрос про
+// эфиры не удался, список всё равно отдаётся, просто без пометок "в
+// эфире" (ошибка идёт в лог).
+func (c *Client) GetFollowedChannels(userID string) ([]domain.FollowedChannel, error) {
+	followed, err := c.fetchFollowedChannels(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	live, err := c.fetchFollowedStreams(userID)
+	if err != nil {
+		log.Println("кто из подписок в эфире:", err)
+		live = nil
+	}
+
+	return domain.MergeFollowed(followed, live), nil
 }
 
 // maxUsersPerRequest — сколько id Twitch принимает в одном Get Users.

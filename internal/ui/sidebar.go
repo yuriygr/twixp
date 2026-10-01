@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"log"
+	"strings"
 	"unsafe"
 
 	"github.com/lxn/walk"
@@ -47,8 +48,13 @@ type sidebar struct {
 	// для chatPane (история, отображаемый сейчас текст).
 	onChannelRemoved func(channelID string)
 
-	resolve   ChannelResolver
-	workspace *app.ChatWorkspace // nil, пока не выполнен успешный вход
+	resolve ChannelResolver
+
+	// fetchFollowed/viewerID — подписки для диалога "Добавить канал" (см.
+	// setFollowed). nil/пусто — диалог без списка подписок.
+	fetchFollowed FollowedFetcher
+	viewerID      string
+	workspace     *app.ChatWorkspace // nil, пока не выполнен успешный вход
 
 	// channelOrder — та же последовательность каналов, что сейчас
 	// выставлена в model. TableView адресует элементы по индексу, а не
@@ -89,6 +95,14 @@ func newSidebar(fetchAvatar ImageFetcher, status statusReporter, onChannelOpened
 func (s *sidebar) setWorkspace(ws *app.ChatWorkspace, resolve ChannelResolver) {
 	s.workspace = ws
 	s.resolve = resolve
+}
+
+// setFollowed сообщает, откуда брать подписки пользователя для списка в
+// диалоге "Добавить канал" (fetch) и чьи именно (viewerID — ID вошедшего:
+// Twitch требует, чтобы он совпадал с пользователем токена).
+func (s *sidebar) setFollowed(fetch FollowedFetcher, viewerID string) {
+	s.fetchFollowed = fetch
+	s.viewerID = viewerID
 }
 
 // reload перечитывает список открытых чатов из workspace и
@@ -399,23 +413,38 @@ func (s *sidebar) currentChannel() (domain.Channel, bool) {
 }
 
 // onAddChannelClicked открывает модальный диалог добавления канала
-// (см. addchanneldialog.go) и, если пользователь ввёл логин и нажал
-// "Добавить", резолвит его и открывает. Резолв логина и Add —
-// блокирующий сетевой I/O, поэтому уходит в отдельную горутину:
+// (см. dialog_add_channel.go) и, если пользователь выбрал каналы или ввёл
+// логин и нажал "Добавить", резолвит их и открывает. Резолв логина и Add
+// — блокирующий сетевой I/O, поэтому уходит в отдельную горутину:
 // дёргать его прямо в обработчике клика значило бы заморозить окно на
 // время сетевого запроса.
 func (s *sidebar) onAddChannelClicked() {
-	login, ok := showAddChannelDialog(s.window)
+	// Уже открытые каналы диалогу нужны, чтобы не предлагать их в списке
+	// подписок ещё раз.
+	open := make(map[string]bool, len(s.channelOrder))
+	for _, ch := range s.channelOrder {
+		open[ch.ID] = true
+	}
+
+	var fetch func() ([]domain.FollowedChannel, error)
+	if s.fetchFollowed != nil && s.viewerID != "" {
+		fetchFollowed, viewerID := s.fetchFollowed, s.viewerID
+		fetch = func() ([]domain.FollowedChannel, error) { return fetchFollowed(viewerID) }
+	}
+
+	logins, ok := showAddChannelDialog(s.window, addChannelDialogData{fetchFollowed: fetch, open: open})
 	if !ok {
 		return
 	}
 
 	s.addChannelBtn.SetEnabled(false)
-	go s.addChannel(login)
+	go s.addChannels(logins)
 }
 
-// addChannel — тело onAddChannelClicked, в отдельной горутине (см. её
-// комментарий).
+// addChannels — тело onAddChannelClicked, в отдельной горутине (см. её
+// комментарий). Добавляет каналы по очереди: сбой на одном (нет такого
+// канала, не удалось подписаться) не мешает остальным, а все ошибки
+// собираются в одно сообщение в статус-баре.
 //
 // s.resolve/s.workspace выставляются вместе в setWorkspace, а кнопка
 // "Добавить канал" физически существует только на странице чата,
@@ -425,17 +454,29 @@ func (s *sidebar) onAddChannelClicked() {
 // незаметно: без неё nil-поле-функция обернулось бы совсем не
 // показательной паникой где-то в глубине горутины, а не понятной
 // ошибкой в статус-баре.
-func (s *sidebar) addChannel(login string) {
-	var channel domain.Channel
-	var err error
+func (s *sidebar) addChannels(logins []string) {
+	var (
+		lastAdded domain.Channel
+		added     bool
+		failures  []string
+	)
 
-	if s.resolve == nil || s.workspace == nil {
-		err = fmt.Errorf("канал %s: sidebar ещё не подключён к рабочей сессии", login)
-	} else {
-		channel, err = s.resolve(login)
+	for _, login := range logins {
+		if s.resolve == nil || s.workspace == nil {
+			failures = append(failures, fmt.Sprintf("%s: sidebar ещё не подключён к рабочей сессии", login))
+			continue
+		}
+
+		channel, err := s.resolve(login)
 		if err == nil {
 			_, err = s.workspace.Add(channel)
 		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", login, err))
+			continue
+		}
+
+		lastAdded, added = channel, true
 	}
 
 	if s.window == nil {
@@ -447,13 +488,14 @@ func (s *sidebar) addChannel(login string) {
 	s.window.Synchronize(func() {
 		s.addChannelBtn.SetEnabled(true)
 
-		if err != nil {
-			s.status.logAndShowError(fmt.Errorf("канал %s: %v", login, err))
-			return
+		if len(failures) > 0 {
+			s.status.logAndShowError(fmt.Errorf("не добавлено — %s", strings.Join(failures, "; ")))
 		}
 
-		s.reload()
-		s.selectChannel(channel.ID)
+		if added {
+			s.reload()
+			s.selectChannel(lastAdded.ID)
+		}
 	})
 }
 

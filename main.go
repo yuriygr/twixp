@@ -197,6 +197,7 @@ func main() {
 			Badges:       helixClient.ChannelBadges,
 			GlobalBadges: helixClient.GlobalBadges,
 			Profile:      helixClient.GetUserProfile,
+			Followed:     helixClient.GetFollowedChannels,
 		}, nil
 	}
 

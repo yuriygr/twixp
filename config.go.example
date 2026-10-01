@@ -6,4 +6,4 @@ package main
 // clientID — Client ID Twitch-приложения для Device Code Flow
 const clientID = "i7j94u6mk0D9cwa5hbltgmxucfk5rc"
 
-var scopes = []string{"user:read:chat", "user:write:chat"}
+var scopes = []string{"user:read:chat", "user:write:chat", "user:read:follows", "user:manage:blocked_users"}
