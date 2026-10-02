@@ -21,16 +21,18 @@ import (
 	"github.com/lxn/walk"
 	"github.com/lxn/walk/declarative"
 
+	"twixp/internal/app"
 	"twixp/internal/domain"
 )
 
 // addChannelDialogData — то, что диалогу нужно от вызывающего кода.
 type addChannelDialogData struct {
-	// fetchFollowed — загрузить каналы из подписок (блокирующий сетевой
-	// вызов, диалог зовёт его из фоновой горутины). nil — списка подписок
-	// нет вовсе (например, ещё не вошли), диалог работает как простое
+	// twitch и viewerID — откуда и чьи подписки загружать (блокирующий
+	// сетевой вызов, диалог зовёт его из фоновой горутины). Нет того или
+	// другого — списка подписок нет вовсе, диалог работает как простое
 	// поле для логина.
-	fetchFollowed func() ([]domain.FollowedChannel, error)
+	twitch   app.TwitchAPI
+	viewerID string
 	// open — ID каналов, уже открытых в сайдбаре: в списке подписок их
 	// не показываем.
 	open map[string]bool
@@ -106,8 +108,10 @@ func showAddChannelDialog(owner *walk.MainWindow, d addChannelDialogData) ([]str
 		dlg.Accept()
 	}
 
+	hasFollowed := d.twitch != nil && d.viewerID != ""
+
 	status := "Загрузка подписок…"
-	if d.fetchFollowed == nil {
+	if !hasFollowed {
 		status = ""
 	}
 
@@ -129,13 +133,13 @@ func showAddChannelDialog(owner *walk.MainWindow, d addChannelDialogData) ([]str
 			declarative.Label{
 				AssignTo: &statusLabel,
 				Text:     status,
-				Visible:  d.fetchFollowed != nil,
+				Visible:  hasFollowed,
 			},
 			declarative.ListBox{
 				AssignTo:        &listBox,
 				MultiSelection:  true,
 				StretchFactor:   1,
-				Visible:         d.fetchFollowed != nil,
+				Visible:         hasFollowed,
 				OnItemActivated: accept,
 			},
 			declarative.Composite{
@@ -163,9 +167,9 @@ func showAddChannelDialog(owner *walk.MainWindow, d addChannelDialogData) ([]str
 
 	// Подписки — в фоне: диалог уже на экране и им можно пользоваться
 	// (ввести логин руками), пока список грузится.
-	if d.fetchFollowed != nil {
+	if hasFollowed {
 		go func() {
-			list, err := d.fetchFollowed()
+			list, err := d.twitch.GetFollowedChannels(d.viewerID)
 
 			owner.Synchronize(func() {
 				if closed {

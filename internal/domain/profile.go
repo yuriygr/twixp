@@ -60,20 +60,8 @@ func AccountAgeText(created, now time.Time) string {
 	return fmt.Sprintf("На Twitch с %s (%d %s)", date, years, yearsWord(years))
 }
 
-// yearsWord — "год"/"года"/"лет" по правилам русского языка.
-func yearsWord(n int) string {
-	if n%100 >= 11 && n%100 <= 14 {
-		return "лет"
-	}
-	switch n % 10 {
-	case 1:
-		return "год"
-	case 2, 3, 4:
-		return "года"
-	default:
-		return "лет"
-	}
-}
+// yearsWord — "год"/"года"/"лет" (см. pluralRu).
+func yearsWord(n int) string { return pluralRu(n, "год", "года", "лет") }
 
 // badgeTitles — русские названия самых распространённых бейджей по set_id
 // (domain.Badge.Name). Названия наши, не официальные: Twitch отдаёт

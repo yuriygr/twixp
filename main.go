@@ -86,18 +86,18 @@ func main() {
 	// EnsureSignedIn и комментарий в internal/ui/mainwindow.go).
 	var mw *ui.MainWindow
 
-	signIn := func(onPrompt func(userCode, verificationURI string)) (ui.SignInResult, error) {
+	signIn := func(onPrompt func(userCode, verificationURI string)) (ui.Session, error) {
 		if appStore == nil || authService == nil {
-			return ui.SignInResult{}, fmt.Errorf("хранилище недоступно")
+			return ui.Session{}, fmt.Errorf("хранилище недоступно")
 		}
 
 		if onPrompt == nil {
 			if _, err := authService.TryReuse(); err != nil {
-				return ui.SignInResult{}, err
+				return ui.Session{}, err
 			}
 		} else {
 			if _, err := authService.EnsureAuthenticated(onPrompt); err != nil {
-				return ui.SignInResult{}, err
+				return ui.Session{}, err
 			}
 		}
 
@@ -111,7 +111,7 @@ func main() {
 
 		me, err := helixClient.GetAuthenticatedUser()
 		if err != nil {
-			return ui.SignInResult{}, fmt.Errorf("получить профиль: %v", err)
+			return ui.Session{}, fmt.Errorf("получить профиль: %v", err)
 		}
 		helixClient.SenderID = me.ID
 
@@ -190,14 +190,10 @@ func main() {
 			}
 		}()
 
-		return ui.SignInResult{
-			Workspace:    workspace,
-			Resolve:      helixClient.GetChannelByLogin,
-			Viewer:       me,
-			Badges:       helixClient.ChannelBadges,
-			GlobalBadges: helixClient.GlobalBadges,
-			Profile:      helixClient.GetUserProfile,
-			Followed:     helixClient.GetFollowedChannels,
+		return ui.Session{
+			Workspace: workspace,
+			Viewer:    me,
+			Twitch:    helixClient,
 		}, nil
 	}
 

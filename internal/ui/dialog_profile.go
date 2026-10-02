@@ -5,18 +5,18 @@ package ui
 
 import (
 	"log"
-	"net/url"
 	"strings"
 	"time"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/walk/declarative"
 
+	"twixp/internal/app"
 	"twixp/internal/domain"
 )
 
 // profileAvatarSize — сторона квадрата под аватарку в окне профиля.
-const profileAvatarSize = 64
+const profileAvatarSize = 72
 
 // profileDialogData — всё, что нужно окну профиля. line — сообщение, по
 // которому кликнули: оттуда берётся то, что известно сразу, без сети
@@ -24,7 +24,7 @@ const profileAvatarSize = 64
 type profileDialogData struct {
 	line         chatLine
 	resolveBadge func(domain.Badge) *walk.Bitmap
-	fetchProfile ProfileFetcher
+	twitch       app.TwitchAPI
 	fetchImage   ImageFetcher
 }
 
@@ -60,7 +60,7 @@ func showProfileDialog(owner *walk.MainWindow, d profileDialogData) {
 	// должно быть пустого квадрата, который потом резко заполняется.
 	// Не получилось создать — не страшно, просто будет пустое место.
 	var avatarImage walk.Image
-	if bmp, err := walk.NewBitmapFromImage(domain.PlaceholderAvatar(profileAvatarSize)); err == nil {
+	if bmp := newAvatarPlaceholder(); bmp != nil {
 		placeholderBmp = bmp
 		avatarImage = bmp
 	}
@@ -141,15 +141,8 @@ func showProfileDialog(owner *walk.MainWindow, d profileDialogData) {
 			Children: []declarative.Widget{
 				declarative.HSpacer{},
 				declarative.PushButton{
-					Text: "Открыть на Twitch",
-					OnClicked: func() {
-						if line.AuthorLogin == "" {
-							return
-						}
-						if err := openURL("https://www.twitch.tv/" + url.PathEscape(line.AuthorLogin)); err != nil {
-							log.Println("открыть профиль в браузере:", err)
-						}
-					},
+					Text:      "Открыть на Twitch",
+					OnClicked: func() { openChannelPage(line.AuthorLogin) },
 				},
 				declarative.PushButton{
 					AssignTo:  &closeBtn,
@@ -177,7 +170,7 @@ func showProfileDialog(owner *walk.MainWindow, d profileDialogData) {
 
 	// Данные из API — в фоне; окно к этому моменту уже на экране.
 	go func() {
-		profile, err := d.fetchProfile(line.AuthorID)
+		profile, err := d.twitch.GetUserProfile(line.AuthorID)
 		if err != nil {
 			log.Printf("профиль %s: %v", line.AuthorLogin, err)
 			owner.Synchronize(func() {
@@ -208,32 +201,12 @@ func showProfileDialog(owner *walk.MainWindow, d profileDialogData) {
 			if desc == "" {
 				desc = "Нет описания"
 			}
-			descEdit.SetText(strings.Replace(desc, "\n", "\r\n", -1))
+			descEdit.SetText(textEditText(desc))
 		})
 
-		if profile.AvatarURL == "" || d.fetchImage == nil {
-			return
-		}
-		img, err := d.fetchImage(profile.AvatarURL)
-		if err != nil {
-			log.Printf("аватарка %s: %v", line.AuthorLogin, err)
-			return
-		}
-
-		owner.Synchronize(func() {
-			if closed {
-				return
-			}
-			// Bitmap — это GDI, создаём в UI-потоке (как toSidebarIcon в
-			// sidebar.go и ensureBadgeIcon в chatpane.go).
-			bmp, err := walk.NewBitmapFromImage(domain.ResizeNearest(img, profileAvatarSize))
-			if err != nil {
-				log.Printf("аватарка %s: %v", line.AuthorLogin, err)
-				return
-			}
-			avatarBmp = bmp
-			avatar.SetImage(bmp)
-		})
+		loadAvatar(owner, avatar, d.fetchImage, profile.AvatarURL, line.AuthorLogin,
+			func() bool { return !closed },
+			func(bmp *walk.Bitmap) { avatarBmp = bmp })
 	}()
 
 	dlg.Run()

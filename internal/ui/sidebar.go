@@ -13,7 +13,6 @@ import (
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
 
-	"twixp/internal/app"
 	"twixp/internal/domain"
 )
 
@@ -48,13 +47,10 @@ type sidebar struct {
 	// для chatPane (история, отображаемый сейчас текст).
 	onChannelRemoved func(channelID string)
 
-	resolve ChannelResolver
-
-	// fetchFollowed/viewerID — подписки для диалога "Добавить канал" (см.
-	// setFollowed). nil/пусто — диалог без списка подписок.
-	fetchFollowed FollowedFetcher
-	viewerID      string
-	workspace     *app.ChatWorkspace // nil, пока не выполнен успешный вход
+	// session — рабочая сессия, доступ к Twitch и вошедший пользователь
+	// (см. Session). nil, пока не выполнен успешный вход, — единственный
+	// признак "вход ещё не выполнен".
+	session *Session
 
 	// channelOrder — та же последовательность каналов, что сейчас
 	// выставлена в model. TableView адресует элементы по индексу, а не
@@ -89,20 +85,10 @@ func newSidebar(fetchAvatar ImageFetcher, status statusReporter, onChannelOpened
 	}
 }
 
-// setWorkspace подключает sidebar к рабочей сессии сразу после
-// успешного входа. До этого момента sidebar существует (виджеты уже
-// построены), но пуст.
-func (s *sidebar) setWorkspace(ws *app.ChatWorkspace, resolve ChannelResolver) {
-	s.workspace = ws
-	s.resolve = resolve
-}
-
-// setFollowed сообщает, откуда брать подписки пользователя для списка в
-// диалоге "Добавить канал" (fetch) и чьи именно (viewerID — ID вошедшего:
-// Twitch требует, чтобы он совпадал с пользователем токена).
-func (s *sidebar) setFollowed(fetch FollowedFetcher, viewerID string) {
-	s.fetchFollowed = fetch
-	s.viewerID = viewerID
+// setSession подключает sidebar к сессии сразу после успешного входа.
+// До этого момента sidebar существует (виджеты уже построены), но пуст.
+func (s *sidebar) setSession(session *Session) {
+	s.session = session
 }
 
 // reload перечитывает список открытых чатов из workspace и
@@ -122,10 +108,10 @@ func (s *sidebar) setFollowed(fetch FollowedFetcher, viewerID string) {
 // одинаково, потому что это одна и та же функция, а не два похожих
 // куска кода в разных местах.
 func (s *sidebar) reload() {
-	if s.workspace == nil {
+	if s.session == nil {
 		return // вход ещё не выполнен — показывать нечего
 	}
-	channels := s.workspace.List()
+	channels := s.session.Workspace.List()
 
 	live := make(map[string]bool, len(channels))
 	for _, ch := range channels {
@@ -212,11 +198,11 @@ func (s *sidebar) currentAvatarURL(channelID string) string {
 // запускаем догрузку аватарок с новыми ссылками. Если состав всё же
 // поменялся (канал закрыли параллельно) — обычный reload.
 func (s *sidebar) refreshChannels() {
-	if s.workspace == nil {
+	if s.session == nil {
 		return
 	}
 
-	channels := s.workspace.List()
+	channels := s.session.Workspace.List()
 	if !sameChannelIDs(channels, s.channelOrder) {
 		s.reload()
 		return
@@ -265,7 +251,7 @@ func (s *sidebar) selectChannel(channelID string) {
 // добавления или удаления (selectChannel). Помечает канал активным в
 // workspace и просит chatPane показать его историю.
 func (s *sidebar) activate(channel domain.Channel) {
-	if err := s.workspace.SetActive(channel.ID); err != nil {
+	if err := s.session.Workspace.SetActive(channel.ID); err != nil {
 		s.status.logAndShowError(err)
 		return
 	}
@@ -305,19 +291,22 @@ func (s *sidebar) onSidebarMouseDown(x, y int, button walk.MouseButton) {
 	_ = s.view.SetCurrentIndex(int(hti.IItem))
 }
 
-// onChannelInfoClicked — пункт контекстного меню "Информация о
-// канале". Показывает то немногое, что у нас реально есть о канале
-// (Helix GetChannelByLogin даёт только это — см. domain.Channel), без
-// придумывания несуществующих полей.
+// onChannelInfoClicked — пункт контекстного меню "Информация о канале":
+// окно с аватаркой, статусом трансляции, статусом подписки и описанием
+// (см. dialog_channel.go). Данные грузятся самим окном в фоне; нужные для
+// этого берутся из сессии (см. Session.Twitch).
 func (s *sidebar) onChannelInfoClicked() {
 	channel, ok := s.currentChannel()
-	if !ok {
+	if !ok || s.session == nil {
 		return
 	}
 
-	walk.MsgBox(s.window, "Информация о канале",
-		fmt.Sprintf("%s\r\nЛогин: %s\r\nID: %s", channel.DisplayName, channel.Name, channel.ID),
-		walk.MsgBoxIconInformation)
+	showChannelDialog(s.window, channelDialogData{
+		channel:    channel,
+		viewerID:   s.session.Viewer.ID,
+		twitch:     s.session.Twitch,
+		fetchImage: s.fetchAvatar,
+	})
 }
 
 // onDeleteChannelClicked — пункт контекстного меню "Удалить чат".
@@ -337,7 +326,7 @@ func (s *sidebar) onDeleteChannelClicked() {
 		return
 	}
 
-	if err := s.workspace.Remove(channel.ID); err != nil {
+	if err := s.session.Workspace.Remove(channel.ID); err != nil {
 		s.status.logAndShowError(fmt.Errorf("удалить чат %s: %v", channel.Name, err))
 	}
 
@@ -419,6 +408,10 @@ func (s *sidebar) currentChannel() (domain.Channel, bool) {
 // дёргать его прямо в обработчике клика значило бы заморозить окно на
 // время сетевого запроса.
 func (s *sidebar) onAddChannelClicked() {
+	if s.session == nil {
+		return
+	}
+
 	// Уже открытые каналы диалогу нужны, чтобы не предлагать их в списке
 	// подписок ещё раз.
 	open := make(map[string]bool, len(s.channelOrder))
@@ -426,13 +419,11 @@ func (s *sidebar) onAddChannelClicked() {
 		open[ch.ID] = true
 	}
 
-	var fetch func() ([]domain.FollowedChannel, error)
-	if s.fetchFollowed != nil && s.viewerID != "" {
-		fetchFollowed, viewerID := s.fetchFollowed, s.viewerID
-		fetch = func() ([]domain.FollowedChannel, error) { return fetchFollowed(viewerID) }
-	}
-
-	logins, ok := showAddChannelDialog(s.window, addChannelDialogData{fetchFollowed: fetch, open: open})
+	logins, ok := showAddChannelDialog(s.window, addChannelDialogData{
+		twitch:   s.session.Twitch,
+		viewerID: s.session.Viewer.ID,
+		open:     open,
+	})
 	if !ok {
 		return
 	}
@@ -446,14 +437,13 @@ func (s *sidebar) onAddChannelClicked() {
 // канала, не удалось подписаться) не мешает остальным, а все ошибки
 // собираются в одно сообщение в статус-баре.
 //
-// s.resolve/s.workspace выставляются вместе в setWorkspace, а кнопка
-// "Добавить канал" физически существует только на странице чата,
-// которая строится уже после успешного входа (см. applySignIn) — то
-// есть сейчас нажать её раньше, чем оба поля выставлены, невозможно.
-// Проверка ниже — не на случай, что это когда-нибудь станет неверным
-// незаметно: без неё nil-поле-функция обернулось бы совсем не
-// показательной паникой где-то в глубине горутины, а не понятной
-// ошибкой в статус-баре.
+// s.session выставляется в setSession после входа, а кнопка "Добавить
+// канал" физически существует только на странице чата, которая строится
+// уже после успешного входа (см. applySignIn) — то есть сейчас нажать её
+// раньше, чем сессия выставлена, невозможно. Проверка ниже — не на случай,
+// что это когда-нибудь станет неверным незаметно: без неё nil-сессия
+// обернулась бы совсем не показательной паникой где-то в глубине
+// горутины, а не понятной ошибкой в статус-баре.
 func (s *sidebar) addChannels(logins []string) {
 	var (
 		lastAdded domain.Channel
@@ -461,15 +451,17 @@ func (s *sidebar) addChannels(logins []string) {
 		failures  []string
 	)
 
+	session := s.session // читаем один раз: дальше работаем в горутине
+
 	for _, login := range logins {
-		if s.resolve == nil || s.workspace == nil {
+		if session == nil {
 			failures = append(failures, fmt.Sprintf("%s: sidebar ещё не подключён к рабочей сессии", login))
 			continue
 		}
 
-		channel, err := s.resolve(login)
+		channel, err := session.Twitch.GetChannelByLogin(login)
 		if err == nil {
-			_, err = s.workspace.Add(channel)
+			_, err = session.Workspace.Add(channel)
 		}
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("%s: %v", login, err))

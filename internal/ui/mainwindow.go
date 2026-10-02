@@ -35,52 +35,20 @@ import (
 	"github.com/lxn/walk/declarative"
 	"github.com/lxn/win"
 
-	"twixp/internal/app"
 	"twixp/internal/domain"
 )
-
-// ChannelResolver находит канал по логину (то же самое, что делает
-// helix.Client.GetChannelByLogin). UI-слою не нужно знать про
-// infra/helix напрямую, поэтому это функция, а не тип из infra.
-type ChannelResolver func(login string) (domain.Channel, error)
 
 // ImageFetcher скачивает и декодирует картинку по URL — обычную
 // публичную HTTPS-ссылку на CDN, токен не нужен. Используется для двух
 // разных вещей, которым обеим нужно ровно одно и то же ("скачать +
 // декодировать"): аватарки каналов в сайдбаре (см. AvatarURL) и иконки
-// бейджей в истории чата (см. BadgeCatalog, chatPane.resolveBadge).
+// бейджей в истории чата (см. chatPane.resolveBadge).
 // UI-слою не нужно знать про net/http или infra/nettls напрямую —
 // composition root даёт готовую реализацию. Ресайз до нужного размера —
 // уже забота конкретного потребителя (см. toSidebarIcon в sidebar.go),
 // а не этой функции: это чисто вопрос того, как картинка будет
 // отрисована, к загрузке отношения не имеет.
 type ImageFetcher func(url string) (image.Image, error)
-
-// ProfileFetcher возвращает публичный профиль пользователя Twitch по ID
-// — для окна "Профиль пользователя" (см. helix.Client.GetUserProfile).
-// Блокирующий сетевой вызов: окно профиля дёргает его из фоновой
-// горутины.
-type ProfileFetcher func(userID string) (domain.UserProfile, error)
-
-// FollowedFetcher возвращает каналы из подписок пользователя с отметкой,
-// кто в эфире (см. helix.Client.GetFollowedChannels) — для списка в
-// диалоге "Добавить канал". Блокирующий сетевой вызов: диалог дёргает его
-// из фоновой горутины.
-type FollowedFetcher func(userID string) ([]domain.FollowedChannel, error)
-
-// BadgeCatalog возвращает каталог бейджей САМОГО канала — какой URL
-// картинки соответствует каждой паре (set_id, id) бейджа, приходящей в
-// domain.ChatMessage.Badges (см. eventsub/message.go). То же самое, что
-// делает helix.Client.ChannelBadges — UI-слою не нужно знать про
-// infra/helix напрямую.
-type BadgeCatalog func(channel domain.Channel) (map[domain.Badge]string, error)
-
-// GlobalBadgeCatalog — то же самое, но без привязки к каналу: набор
-// бейджей, одинаковых везде (модератор, Prime, турбо и т.п.). Отдельный
-// тип, а не BadgeCatalog с игнорируемым аргументом — сигнатура сама
-// документирует, что канал тут не нужен, а не полагается на комментарий
-// рядом с вызовом. См. helix.Client.GlobalBadges.
-type GlobalBadgeCatalog func() (map[domain.Badge]string, error)
 
 // SettingsLoader читает сохранённые настройки (то же самое, что делает
 // store.Store.LoadSettings). Без error в сигнатуре — "настроек ещё
@@ -94,33 +62,6 @@ type SettingsLoader func() domain.Settings
 // целиком и передаёт его при каждом изменении любого переключателя.
 type SettingsSaver func(domain.Settings) error
 
-// SignInResult — то, что нужно UI-слою после успешного входа: рабочий
-// ChatWorkspace, способ находить канал по логину и данные самого
-// вошедшего пользователя. Собирает их composition root (там же, где
-// инфра — Helix-клиент, EventSub-хаб), UI сами infra-типы не видит.
-type SignInResult struct {
-	Workspace *app.ChatWorkspace
-	Resolve   ChannelResolver
-	// Viewer — авторизованный пользователь (тот же аккаунт, что
-	// отправляет сообщения). chatPane использует его логин/отображаемое
-	// имя, чтобы подсвечивать сообщения с упоминанием (см.
-	// chatPane.setViewer).
-	Viewer domain.User
-	// Badges — каталог бейджей конкретного канала (см. BadgeCatalog).
-	Badges BadgeCatalog
-	// GlobalBadges — общий для всех каналов каталог (см.
-	// GlobalBadgeCatalog) — chatPane запускает его загрузку сразу же,
-	// один раз за сессию, не дожидаясь первого сообщения с бейджем (см.
-	// chatPane.setGlobalBadgeCatalog).
-	GlobalBadges GlobalBadgeCatalog
-	// Profile — источник профилей пользователей для окна "Профиль
-	// пользователя" (см. ProfileFetcher).
-	Profile ProfileFetcher
-	// Followed — источник подписок пользователя для диалога "Добавить
-	// канал" (см. FollowedFetcher).
-	Followed FollowedFetcher
-}
-
 // SignIn выполняет вход целиком: авторизацию и разворачивание рабочей
 // сессии (Helix-клиент, EventSub-хаб, ChatWorkspace, восстановление
 // сохранённых чатов).
@@ -131,7 +72,7 @@ type SignInResult struct {
 // жать "Войти". onPrompt != nil — сигнал "можно и интерактивно", он же
 // и есть способ показать пользователю код устройства; используется
 // только в ответ на клик по кнопке "Войти".
-type SignIn func(onPrompt func(userCode, verificationURI string)) (SignInResult, error)
+type SignIn func(onPrompt func(userCode, verificationURI string)) (Session, error)
 
 // statusReporter — общий канал сообщений об ошибках/статусе для
 // MainWindow и его дочерних контроллеров (sidebar, chatPane). Оба
@@ -579,20 +520,18 @@ func (m *MainWindow) EnsureSignedIn() {
 // тихого входа, либо один раз из signInPage), но это не предположение,
 // на которое опирается код: pageHost.show просто идемпотентно заменяет
 // текущую страницу, какая бы она ни была.
-func (m *MainWindow) applySignIn(result SignInResult) {
+func (m *MainWindow) applySignIn(result Session) {
 	if err := m.pages.show(buildChatPage(m)); err != nil {
 		log.Println("построить страницу чата:", err)
 		m.window.Close()
 		return
 	}
 
-	m.sidebar.setWorkspace(result.Workspace, result.Resolve)
-	m.sidebar.setFollowed(result.Followed, result.Viewer.ID)
-	m.chatPane.setWorkspace(result.Workspace)
-	m.chatPane.setViewer(result.Viewer)
-	m.chatPane.setBadgeCatalog(result.Badges)
-	m.chatPane.setGlobalBadgeCatalog(result.GlobalBadges)
-	m.chatPane.setProfileFetcher(result.Profile)
+	// Один объект на оба компонента: вошли — значит, есть всё сразу
+	// (рабочая сессия, зритель, доступ к Twitch).
+	session := &result
+	m.sidebar.setSession(session)
+	m.chatPane.setSession(session)
 
 	m.setStatus("")
 	m.sidebar.reload()

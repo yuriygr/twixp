@@ -63,7 +63,11 @@ type chatPane struct {
 	window *walk.MainWindow // для Synchronize из горутин; выставляется в New() после build()
 	status statusReporter
 
-	workspace *app.ChatWorkspace // nil, пока не выполнен успешный вход
+	// session — рабочая сессия, доступ к Twitch и вошедший пользователь
+	// (см. Session). nil, пока не выполнен успешный вход, — единственный
+	// признак "вход ещё не выполнен"; ensureBadgeCatalog в этом случае
+	// просто ничего не делает, бейджи молча не подсвечиваются, а не падают.
+	session *Session
 
 	// history — накопленные строки чата по каждому каналу (по ID),
 	// независимо от того, показан ли он сейчас. У каждого канала своя
@@ -98,28 +102,16 @@ type chatPane struct {
 	// подсветки сообщений с упоминанием (см. isMentioned) — нулевое
 	// значение (пустой domain.User, до успешного входа) просто никогда
 	// ни с чем не совпадает.
-	viewer domain.User
 
 	// fetchIcon — общий с sidebar способ "скачать+декодировать картинку
 	// по URL" (см. ui.ImageFetcher), здесь используется только для
 	// иконок бейджей (см. resolveBadge/ensureBadgeIcon).
 	fetchIcon ImageFetcher
 
-	// fetchProfile — способ получить публичный профиль пользователя по
-	// ID (см. ProfileFetcher); выставляется после входа
-	// (setProfileFetcher), до того пункт "Профиль пользователя" в меню
-	// просто ничего не открывает.
-	fetchProfile ProfileFetcher
-	// badgeCatalog — способ узнать URL картинки бейджа для конкретного
-	// канала (см. ui.BadgeCatalog). nil, пока не выполнен успешный вход
-	// (см. setBadgeCatalog) — ensureBadgeCatalog в этом случае просто
-	// ничего не делает, бейджи молча не подсвечиваются, а не падают.
-	badgeCatalog BadgeCatalog
-
 	// badgeURLs — кэш каталога бейджей по каждому каналу (по ID):
 	// какой URL соответствует паре (set_id, id) бейджа. Тянется из
-	// badgeCatalog один раз на канал (см. ensureBadgeCatalog) — Helix
-	// дёргать на каждое сообщение незачем, набор бейджей канала meняется
+	// Twitch один раз на канал (см. ensureBadgeCatalog) — Helix
+	// дёргать на каждое сообщение незачем, набор бейджей канала меняется
 	// не чаще, чем раз в сессию. Тут только бейджи САМОГО канала
 	// (кастомные уровни подписки и т.п.) — общие для всех каналов
 	// (модератор, Prime и т.п.) лежат отдельно, в globalBadges.
@@ -133,7 +125,7 @@ type chatPane struct {
 
 	// globalBadges — общий для всех каналов каталог (модератор, Prime,
 	// турбо и т.п. — одна и та же картинка везде), загружается один раз
-	// за сессию сразу после входа (см. setGlobalBadgeCatalog), а не
+	// за сессию сразу после входа (см. setSession), а не
 	// лениво по требованию — раз он всё равно понадобится почти сразу
 	// на любом канале, разумно не ждать первого повода. nil, пока не
 	// подтянулся (или пока не выполнен вход) — badgeImageURL в этом
@@ -249,83 +241,19 @@ func (p *chatPane) attachMentionPopup(owner win.HWND) {
 	})
 }
 
-// setWorkspace подключает chatPane к рабочей сессии сразу после
-// успешного входа.
-func (p *chatPane) setWorkspace(ws *app.ChatWorkspace) {
-	p.workspace = ws
-}
-
-// Shutdown освобождает сетевые ресурсы workspace перед выходом из
-// приложения (см. MainWindow, пункт меню трея "Закрыть") — реальное
-// закрытие подписок EventSub (HTTP DeleteSubscription на каждый
-// открытый канал), а не просто "процесс убит, Twitch сам разберётся по
-// таймауту". До этого вызова такого закрытия не было вообще: ни один
-// путь выхода не доходил до ChatWorkspace.Close() ни разу, и открытые
-// подписки при каждом закрытии просто бросались недообработанными.
-//
-// p.workspace == nil — сюда можно дойти, даже если пользователь так и
-// не вошёл (setWorkspace вызывается только после успешного входа) —
-// тогда закрывать нечего.
-func (p *chatPane) Shutdown() {
-	if p.workspace == nil {
-		return
-	}
-	if err := p.workspace.Close(); err != nil {
-		log.Println("закрыть чаты при выходе:", err)
-	}
-}
-
-// setViewer запоминает авторизованного пользователя — нужен только для
-// подсветки сообщений с упоминанием (см. isMentioned/appendMessage).
-func (p *chatPane) setViewer(viewer domain.User) {
-	p.viewer = viewer
-}
-
-// setProfileFetcher сообщает, откуда брать профили пользователей для
-// окна "Профиль пользователя" — вызывается после входа, когда появляется
-// Helix-клиент.
-func (p *chatPane) setProfileFetcher(fetch ProfileFetcher) {
-	p.fetchProfile = fetch
-}
-
-// openProfile открывает окно профиля автора строки (пункт "Профиль
-// пользователя" контекстного меню). Иконки бейджей берутся из
-// каталога показанного сейчас канала — а именно из него и кликнули по
-// сообщению.
-func (p *chatPane) openProfile(line chatLine) {
-	if p.fetchProfile == nil || line.AuthorID == "" {
-		return
-	}
-
-	showProfileDialog(p.window, profileDialogData{
-		line:         line,
-		resolveBadge: p.resolveBadge,
-		fetchProfile: p.fetchProfile,
-		fetchImage:   p.fetchIcon,
-	})
-}
-
-// setBadgeCatalog подключает способ узнавать бейджи канала сразу после
-// успешного входа — до этого момента (и если вход ещё не произошёл)
-// ensureBadgeCatalog просто ничего не делает.
-func (p *chatPane) setBadgeCatalog(catalog BadgeCatalog) {
-	p.badgeCatalog = catalog
-}
-
-// setGlobalBadgeCatalog запускает разовую загрузку глобального каталога
-// бейджей сразу после успешного входа — не откладывая до первого
-// сообщения с бейджем: раз он один на всю сессию и понадобится почти
-// сразу на любом канале, разумно стартовать загрузку сейчас, а не ждать
-// повода (в отличие от каталога КОНКРЕТНОГО канала, см.
+// setSession подключает chatPane к сессии сразу после успешного входа и
+// запускает разовую загрузку глобального каталога бейджей — не откладывая
+// до первого сообщения с бейджем: раз он один на всю сессию и понадобится
+// почти сразу на любом канале, разумно стартовать загрузку сейчас, а не
+// ждать повода (в отличие от каталога КОНКРЕТНОГО канала, см.
 // ensureBadgeCatalog — там ожидание оправдано, потому что каналов может
 // быть много и не факт, что все будут открыты).
-func (p *chatPane) setGlobalBadgeCatalog(catalog GlobalBadgeCatalog) {
-	if catalog == nil {
-		return
-	}
+func (p *chatPane) setSession(session *Session) {
+	p.session = session
 
+	twitch := session.Twitch
 	go func() {
-		badges, err := catalog()
+		badges, err := twitch.GlobalBadges()
 
 		p.window.Synchronize(func() {
 			if err != nil {
@@ -344,6 +272,43 @@ func (p *chatPane) setGlobalBadgeCatalog(catalog GlobalBadgeCatalog) {
 			}
 		})
 	}()
+}
+
+// Shutdown освобождает сетевые ресурсы workspace перед выходом из
+// приложения (см. MainWindow, пункт меню трея "Закрыть") — реальное
+// закрытие подписок EventSub (HTTP DeleteSubscription на каждый
+// открытый канал), а не просто "процесс убит, Twitch сам разберётся по
+// таймауту". До этого вызова такого закрытия не было вообще: ни один
+// путь выхода не доходил до ChatWorkspace.Close() ни разу, и открытые
+// подписки при каждом закрытии просто бросались недообработанными.
+//
+// p.session == nil — сюда можно дойти, даже если пользователь так и не
+// вошёл (setSession вызывается только после успешного входа) — тогда
+// закрывать нечего.
+func (p *chatPane) Shutdown() {
+	if p.session == nil {
+		return
+	}
+	if err := p.session.Workspace.Close(); err != nil {
+		log.Println("закрыть чаты при выходе:", err)
+	}
+}
+
+// openProfile открывает окно профиля автора строки (пункт "Профиль
+// пользователя" контекстного меню). Иконки бейджей берутся из
+// каталога показанного сейчас канала — а именно из него и кликнули по
+// сообщению.
+func (p *chatPane) openProfile(line chatLine) {
+	if p.session == nil || line.AuthorID == "" {
+		return
+	}
+
+	showProfileDialog(p.window, profileDialogData{
+		line:         line,
+		resolveBadge: p.resolveBadge,
+		twitch:       p.session.Twitch,
+		fetchImage:   p.fetchIcon,
+	})
 }
 
 // showChannel показывает накопленную историю канала — иначе после
@@ -407,7 +372,7 @@ func (p *chatPane) ensureWatching(channel domain.Channel) {
 	if p.watching[channel.ID] != 0 {
 		return
 	}
-	_, service, ok := p.workspace.Get(channel.ID)
+	_, service, ok := p.session.Workspace.Get(channel.ID)
 	if !ok {
 		return
 	}
@@ -423,17 +388,19 @@ func (p *chatPane) ensureWatching(channel domain.Channel) {
 // sidebar.ensureAvatar для аватарок: сеть в отдельной горутине,
 // применение — через Synchronize (см. fetchOnce в asyncfetch.go).
 func (p *chatPane) ensureBadgeCatalog(channel domain.Channel) {
-	if p.badgeCatalog == nil {
+	if p.session == nil {
 		return
 	}
 	if _, ok := p.badgeURLs[channel.ID]; ok {
 		return
 	}
 
+	twitch := p.session.Twitch
+
 	fetchOnce(p.window, p.badgeURLsInFlight, channel.ID,
 		fmt.Sprintf("бейджи канала %s:", channel.Name),
 		func() (apply func(), err error) {
-			catalog, err := p.badgeCatalog(channel)
+			catalog, err := twitch.ChannelBadges(channel)
 			if err != nil {
 				return nil, err
 			}
@@ -607,7 +574,7 @@ func (p *chatPane) appendMessage(channelID string, msg domain.ChatMessage) {
 	// "@viewer" в начале — самое настоящее упоминание, и оно не должно
 	// пропасть просто из-за того, что мы прячем его из отображаемого
 	// текста (см. stripReplyMentionPrefix).
-	mentioned := domain.IsMentioned(msg.Text, p.viewer)
+	mentioned := domain.IsMentioned(msg.Text, p.session.Viewer)
 
 	nc := domain.NicknameColor(msg.Author.ID, msg.Author.Login, msg.Author.Color)
 
@@ -850,7 +817,7 @@ func (p *chatPane) onInputTextChanged() {
 		return
 	}
 
-	channel, _, ok := p.workspace.Active()
+	channel, _, ok := p.session.Workspace.Active()
 	if !ok {
 		p.closeMentionPopup()
 		return
@@ -968,7 +935,7 @@ func (p *chatPane) sendCurrentInput() {
 		return
 	}
 
-	_, service, ok := p.workspace.Active()
+	_, service, ok := p.session.Workspace.Active()
 	if !ok {
 		p.status.logAndShowError(fmt.Errorf("нет активного чата"))
 		return

@@ -15,6 +15,9 @@ import (
 	"twixp/internal/infra/nettls"
 )
 
+// Client обязан реализовывать порт, который видит UI-слой.
+var _ app.TwitchAPI = (*Client)(nil)
+
 const defaultBaseURL = "https://api.twitch.tv/helix"
 
 // TokenProvider возвращает текущий рабочий access token. В боевом коде
@@ -313,6 +316,74 @@ func (c *Client) GetFollowedChannels(userID string) ([]domain.FollowedChannel, e
 	}
 
 	return domain.MergeFollowed(followed, live), nil
+}
+
+type streamsResponse struct {
+	Data []struct {
+		Type        string `json:"type"`
+		Title       string `json:"title"`
+		GameName    string `json:"game_name"`
+		ViewerCount int    `json:"viewer_count"`
+		StartedAt   string `json:"started_at"`
+	} `json:"data"`
+}
+
+// GetStream возвращает состояние трансляции канала (Get Streams, права
+// не нужны). Пустой ответ — канал не в эфире, это не ошибка.
+func (c *Client) GetStream(channelID string) (domain.StreamInfo, error) {
+	var out streamsResponse
+	if err := c.getJSON("/streams", url.Values{"user_id": {channelID}}, &out); err != nil {
+		return domain.StreamInfo{}, err
+	}
+	if len(out.Data) == 0 {
+		return domain.StreamInfo{}, nil
+	}
+
+	d := out.Data[0]
+	// type у идущей трансляции — "live"; пустое значение Twitch
+	// использует для ошибок и в эфир не считается.
+	if d.Type != "live" {
+		return domain.StreamInfo{}, nil
+	}
+
+	info := domain.StreamInfo{
+		Live:    true,
+		Title:   d.Title,
+		Game:    d.GameName,
+		Viewers: d.ViewerCount,
+	}
+	if t, err := time.Parse(time.RFC3339, d.StartedAt); err == nil {
+		info.StartedAt = t
+	}
+	return info, nil
+}
+
+type followStatusResponse struct {
+	Data []struct {
+		FollowedAt string `json:"followed_at"`
+	} `json:"data"`
+}
+
+// GetFollowStatus выясняет, подписан ли пользователь viewerID на канал
+// channelID, и с какой даты (Get Followed Channels с фильтром по
+// каналу; нужен scope user:read:follows, viewerID должен быть
+// пользователем токена). Подписаться или отписаться из приложения
+// нельзя: Twitch убрал такие запросы из API в 2021 году без замены.
+func (c *Client) GetFollowStatus(viewerID, channelID string) (domain.FollowStatus, error) {
+	var out followStatusResponse
+	query := url.Values{"user_id": {viewerID}, "broadcaster_id": {channelID}}
+	if err := c.getJSON("/channels/followed", query, &out); err != nil {
+		return domain.FollowStatus{}, err
+	}
+	if len(out.Data) == 0 {
+		return domain.FollowStatus{}, nil
+	}
+
+	status := domain.FollowStatus{Following: true}
+	if t, err := time.Parse(time.RFC3339, out.Data[0].FollowedAt); err == nil {
+		status.Since = t
+	}
+	return status, nil
 }
 
 // maxUsersPerRequest — сколько id Twitch принимает в одном Get Users.

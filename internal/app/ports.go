@@ -111,3 +111,32 @@ type AuthFlow interface {
 type TokenRefresher interface {
 	Refresh(refreshToken string) (domain.Token, error)
 }
+
+// TwitchAPI — всё, что окнам нужно спросить у Twitch после входа: найти
+// канал по логину, каталоги бейджей, профиль пользователя, подписки,
+// состояние трансляции. Все методы — блокирующие сетевые вызовы, UI
+// дёргает их только из фоновых горутин.
+//
+// Один интерфейс вместо набора отдельных функций: новая возможность
+// окна — это новый метод здесь и в helix.Client, а не новый тип, поле в
+// каждом компоненте и сеттер в applySignIn. Имена методов совпадают с
+// helix.Client, поэтому он реализует интерфейс напрямую, без переходников
+// (проверка — в helix/client.go).
+type TwitchAPI interface {
+	// GetChannelByLogin находит канал по логину (добавление чата).
+	GetChannelByLogin(login string) (domain.Channel, error)
+	// ChannelBadges — каталог бейджей самого канала: какой URL картинки
+	// соответствует каждой паре (set_id, id) бейджа в сообщениях.
+	ChannelBadges(channel domain.Channel) (map[domain.Badge]string, error)
+	// GlobalBadges — то же без привязки к каналу: бейджи, одинаковые
+	// везде (модератор, Prime, турбо и т.п.).
+	GlobalBadges() (map[domain.Badge]string, error)
+	// GetUserProfile — публичный профиль пользователя по ID.
+	GetUserProfile(userID string) (domain.UserProfile, error)
+	// GetFollowedChannels — подписки пользователя с отметкой, кто в эфире.
+	GetFollowedChannels(userID string) ([]domain.FollowedChannel, error)
+	// GetStream — состояние трансляции канала.
+	GetStream(channelID string) (domain.StreamInfo, error)
+	// GetFollowStatus — подписан ли зритель на канал.
+	GetFollowStatus(viewerID, channelID string) (domain.FollowStatus, error)
+}

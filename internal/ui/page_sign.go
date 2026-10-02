@@ -70,7 +70,7 @@ type signInPage struct {
 	deviceCodeLine3 *walk.Label // "и введите код: XXXXXXXX"
 
 	signIn    SignIn
-	onSuccess func(SignInResult)
+	onSuccess func(Session)
 }
 
 // deviceCodeLine строит один центрированный ряд для строки device-кода
@@ -93,7 +93,7 @@ func deviceCodeLine(assignTo **walk.Label) declarative.Widget {
 }
 
 // buildSignInPage — pageFactory для pageHost.show (см. pagehost.go).
-func buildSignInPage(signIn SignIn, onSuccess func(SignInResult)) pageFactory {
+func buildSignInPage(signIn SignIn, onSuccess func(Session)) pageFactory {
 	return func(parent walk.Container) (*walk.Composite, error) {
 		p := &signInPage{signIn: signIn, onSuccess: onSuccess}
 		if err := p.build(parent); err != nil {
